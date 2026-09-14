@@ -15,6 +15,21 @@
 # Example:
 #   sudo ./scripts/create-geneve-link.sh -r 192.168.1.2 -a 10.0.0.1/24 -v 42
 #
+# MAC address assignment:
+#   The kernel Geneve driver generates a random MAC for each new interface.  On
+#   some kernels the RNG seed produces the same value on every machine, so two
+#   peers end up with identical MACs.  When that happens the receiving kernel's
+#   loopback-detection logic (source MAC == own MAC) silently drops every inbound
+#   frame.  This script derives a deterministic, unique MAC from the local tunnel
+#   IP and the VNI so the two endpoints are always distinct:
+#
+#     byte 0 : 0xc2  (locally administered, unicast)
+#     byte 1 : VNI bits [23:16]
+#     byte 2 : VNI bits [15:8]
+#     byte 3 : VNI bits [7:0]
+#     byte 4 : local tunnel IP octet 3
+#     byte 5 : local tunnel IP octet 4
+#
 # Requirements:
 #   - Linux kernel with Geneve module (geneve.ko)
 #   - iproute2 (ip command)
@@ -29,6 +44,35 @@ REMOTE=""
 VNI=1
 PORT=6081
 ADDR=""
+
+# ---------- MAC derivation ----------------------------------------------------
+# Derive a locally-administered unicast MAC that is unique per (local-IP, VNI).
+# This prevents the loopback-drop when two peers are assigned the same random MAC
+# by the kernel.
+#
+# Arguments:
+#   $1 — local tunnel CIDR  (e.g. 192.168.100.1/24)
+#   $2 — VNI                (integer, 1–16777215)
+# Prints the MAC in aa:bb:cc:dd:ee:ff notation.
+derive_mac() {
+    local cidr="$1"
+    local vni="$2"
+
+    # Strip the prefix length to get the bare IP
+    local ip="${cidr%%/*}"
+
+    # Split into octets
+    local o1 o2 o3 o4
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+
+    # Encode VNI into three bytes
+    local v1=$(( (vni >> 16) & 0xFF ))
+    local v2=$(( (vni >>  8) & 0xFF ))
+    local v3=$(( vni         & 0xFF ))
+
+    # 0xc2 = 1100 0010: locally administered (bit 1 set), unicast (bit 0 clear)
+    printf 'c2:%02x:%02x:%02x:%02x:%02x' "$v1" "$v2" "$v3" "$o3" "$o4"
+}
 
 # ---------- helpers -----------------------------------------------------------
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -93,12 +137,20 @@ if ip link show "$IFACE" &>/dev/null; then
     ip link delete "$IFACE"
 fi
 
+# ---------- derive a stable MAC for this endpoint -----------------------------
+MAC=$(derive_mac "$ADDR" "$VNI")
+info "Derived MAC $MAC  (local=${ADDR%%/*}  vni=$VNI)"
+
 # ---------- create the Geneve link --------------------------------------------
 info "Creating Geneve interface '$IFACE'  (remote=$REMOTE  vni=$VNI  port=$PORT)"
 ip link add "$IFACE" type geneve \
     remote  "$REMOTE"   \
     vni     "$VNI"      \
     dstport "$PORT"
+
+# Override the kernel-assigned MAC with our deterministic one before bringing
+# the interface up, so no traffic is ever sent with the random MAC.
+ip link set "$IFACE" address "$MAC"
 
 # ---------- assign IPv4 address and bring the interface up --------------------
 info "Assigning address $ADDR to $IFACE"
