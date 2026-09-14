@@ -6,11 +6,16 @@ CFLAGS  := -Wall -Wextra -Wpedantic -std=c11 \
 SRC_DIR := src
 SRCS    := $(SRC_DIR)/main.c $(SRC_DIR)/geneve.c
 OBJS    := $(SRCS:.c=.o)
-TARGET  := geneve
+TARGET     := geneve
+PP_SRC     := $(SRC_DIR)/preprocess.c
+PP_TARGET  := preprocess
 
-.PHONY: all clean
+.PHONY: all preprocess clean
 
 all: $(TARGET)
+
+preprocess: $(PP_SRC)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $< -lssl -lcrypto
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
@@ -19,4 +24,4 @@ $(SRC_DIR)/%.o: $(SRC_DIR)/%.c $(SRC_DIR)/geneve.h
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) $(PP_TARGET)
