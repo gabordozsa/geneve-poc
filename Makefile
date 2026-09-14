@@ -7,14 +7,14 @@ SRC_DIR := src
 SRCS    := $(SRC_DIR)/main.c $(SRC_DIR)/geneve.c
 OBJS    := $(SRCS:.c=.o)
 TARGET     := geneve
-PP_SRC     := $(SRC_DIR)/preprocess.c
-PP_TARGET  := preprocess
+PP_SRC     := $(SRC_DIR)/proxy.c
+PP_TARGET  := proxy
 
-.PHONY: all preprocess clean
+.PHONY: all proxy clean
 
 all: $(TARGET)
 
-preprocess: $(PP_SRC)
+proxy: $(PP_SRC)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $< -lssl -lcrypto
 
 $(TARGET): $(OBJS)

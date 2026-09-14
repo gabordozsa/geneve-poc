@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # gen-certs.sh — generate a self-signed CA and a server certificate for
-#                testing preprocess with -L (local TLS) and/or -R (remote TLS).
+#                testing proxy with -L (local TLS) and/or -R (remote TLS).
 #
 # Output (written to ./certs/ relative to the project root):
 #   certs/ca.key        CA private key
@@ -14,7 +14,7 @@
 #   CN=192.168.1.10 ./scripts/gen-certs.sh
 #
 # The paths certs/server.crt and certs/server.key are the defaults compiled
-# into preprocess.c (SERVER_CERT / SERVER_KEY macros).  Override at build
+# into proxy.c (SERVER_CERT / SERVER_KEY macros).  Override at build
 # time with:
 #   gcc ... -DSERVER_CERT=\"/path/to/cert.pem\" -DSERVER_KEY=\"/path/to/key.pem\"
 
@@ -52,7 +52,7 @@ openssl req -new -x509 \
     -key    "$OUT_DIR/ca.key" \
     -out    "$OUT_DIR/ca.crt" \
     -days   "$DAYS" \
-    -subj   "/CN=Preprocess-Test-CA/O=preprocess/OU=testing" \
+    -subj   "/CN=Proxy-Test-CA/O=proxy/OU=testing" \
     2>/dev/null
 
 # ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ prompt             = no
 
 [dn]
 CN = ${CN}
-O  = preprocess
+O  = proxy
 OU = testing
 
 [req_ext]
@@ -139,11 +139,11 @@ openssl x509 -noout -subject -issuer -dates -ext subjectAltName \
 echo ""
 echo "Quick-start:"
 echo "  Build :  gcc -Wall -Wextra -std=c11 -D_GNU_SOURCE -O2 -g \\"
-echo "               src/preprocess.c -o preprocess -lssl -lcrypto"
+echo "               src/proxy.c -o proxy -lssl -lcrypto"
 echo ""
-echo "  Local TLS only  (-L):  ./preprocess -l 8443 -r 127.0.0.1 -p 9000 -L"
-echo "  Remote TLS only (-R):  ./preprocess -l 8080 -r 127.0.0.1 -p 443  -R"
-echo "  Both sides      (-LR): ./preprocess -l 8443 -r 127.0.0.1 -p 443  -L -R"
+echo "  Local TLS only  (-L):  ./proxy -l 8443 -r 127.0.0.1 -p 9000 -L"
+echo "  Remote TLS only (-R):  ./proxy -l 8080 -r 127.0.0.1 -p 443  -R"
+echo "  Both sides      (-LR): ./proxy -l 8443 -r 127.0.0.1 -p 443  -L -R"
 echo ""
 echo "  Test TLS local with openssl s_client:"
 echo "    openssl s_client -connect 127.0.0.1:8443 -CAfile $OUT_DIR/ca.crt"

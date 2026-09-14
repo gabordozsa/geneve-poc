@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # test-setup.sh — set up two network namespaces connected by a veth pair and
-#                 start a preprocess instance in each, optionally linked by TLS.
+#                 start a proxy instance in each, optionally linked by TLS.
 #
 # Topology (TLS mode):
 #
 #   [client ns]                                    [server ns]
 #   curl http://127.0.0.1:5201                     python3 -m http.server :5301
 #       ↓ plain TCP :5201                          ↑ plain TCP :5301 (per request)
-#   preprocess -l 5201 -r 10.0.0.2 -p 5201 -R -F  preprocess -l 5201 -r 127.0.0.1 -p 5301 -L -S -D
+#   proxy -l 5201 -r 10.0.0.2 -p 5201 -R -F       proxy -l 5201 -r 127.0.0.1 -p 5301 -L -S -D
 #       ↓ TLS (permanent)                          ↑ TLS (permanent inter-proxy link)
 #   veth-client 10.0.0.1 ←──────────────────────── veth-server 10.0.0.2
 #
@@ -16,7 +16,7 @@
 #   [client ns]                                    [server ns]
 #   curl http://127.0.0.1:5201                     python3 -m http.server :5301
 #       ↓ plain TCP :5201                          ↑ plain TCP :5301 (per request)
-#   preprocess -l 5201 -r 10.0.0.2 -p 5201 -F     preprocess -l 5201 -r 127.0.0.1 -p 5301 -S -D
+#   proxy -l 5201 -r 10.0.0.2 -p 5201 -F          proxy -l 5201 -r 127.0.0.1 -p 5301 -S -D
 #       ↓ plain TCP (permanent)                    ↑ plain TCP (permanent inter-proxy link)
 #   veth-client 10.0.0.1 ←──────────────────────── veth-server 10.0.0.2
 #
@@ -26,14 +26,14 @@
 #
 # Startup order:
 #   1. python3 http.server in 'server' ns on HTTP_PORT (5301)
-#   2. server-side preprocess: listens on PROXY_PORT (5201), no backend connection yet (-D)
-#   3. client-side preprocess: connects to server proxy (permanent), listens plain on PROXY_PORT
+#   2. server-side proxy: listens on PROXY_PORT (5201), no backend connection yet (-D)
+#   3. client-side proxy: connects to server proxy (permanent), listens plain on PROXY_PORT
 #   4. curl from 'client' ns to 127.0.0.1:PROXY_PORT
 #
 # Environment variables:
-#   USE_TLS=1    Enable TLS between the two preprocess instances (default: off)
+#   USE_TLS=1    Enable TLS between the two proxy instances (default: off)
 #
-# Requires: ip(8), iproute2, python3, and the ./preprocess binary.
+# Requires: ip(8), iproute2, python3, and the ./proxy binary.
 # Run as root (network namespace creation requires CAP_SYS_ADMIN).
 
 set -euo pipefail
@@ -41,7 +41,7 @@ set -euo pipefail
 IPERF="/home/ubuntu/iperf2/src/iperf"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PREPROCESS="$SCRIPT_DIR/preprocess"
+PROXY="$SCRIPT_DIR/proxy"
 CERTS_DIR="$SCRIPT_DIR/certs"
 USE_TLS="${USE_TLS:-1}"          # set to any non-empty value to enable TLS between proxies
 
@@ -52,7 +52,7 @@ VETH_SERVER="veth-server"
 CLIENT_IP="10.0.0.1"
 SERVER_IP="10.0.0.2"
 PREFIX_LEN="24"
-PROXY_PORT="5201"   # port the two preprocess instances communicate on
+PROXY_PORT="5201"   # port the two proxy instances communicate on
 HTTP_PORT="5301"    # port python http.server listens on inside the server namespace
 
 # ---------------------------------------------------------------------------
@@ -63,11 +63,11 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if [[ ! -x "$PREPROCESS" ]]; then
-    echo "error: preprocess binary not found at $PREPROCESS" >&2
+if [[ ! -x "$PROXY" ]]; then
+    echo "error: proxy binary not found at $PROXY" >&2
     echo "       Build it first:" >&2
     echo "         gcc -Wall -Wextra -std=c11 -D_GNU_SOURCE -O2 -g \\" >&2
-    echo "             src/preprocess.c -o preprocess -lssl -lcrypto" >&2
+    echo "             src/proxy.c -o proxy -lssl -lcrypto" >&2
     exit 1
 fi
 
@@ -118,19 +118,19 @@ ip netns exec "$SERVER_NS" ip link set "$VETH_SERVER" up
 ip netns exec "$SERVER_NS" ip link set lo up
 
 # ---------------------------------------------------------------------------
-# 3. Start preprocess in the server namespace
+# 3. Start proxy in the server namespace
 # ---------------------------------------------------------------------------
 # Server-side proxy: receives framed data from the client-side proxy (-S to strip
 # the control byte from upstream data), closes the upstream connection on DISCONNECT
 # frames (-C), and forwards plain data to the HTTP server.
 if [[ -n "$USE_TLS" ]]; then
-    echo "==> Starting preprocess in '$SERVER_NS' namespace (TLS listener :$PROXY_PORT -> 127.0.0.1:$HTTP_PORT plain, -S -D)"
+    echo "==> Starting proxy in '$SERVER_NS' namespace (TLS listener :$PROXY_PORT -> 127.0.0.1:$HTTP_PORT plain, -S -D)"
     ip netns exec "$SERVER_NS" \
-        "$PREPROCESS" -l "$PROXY_PORT" -r "127.0.0.1" -p "$HTTP_PORT" -L -S -D -n server &
+        "$PROXY" -l "$PROXY_PORT" -r "127.0.0.1" -p "$HTTP_PORT" -L -S -D -n server &
 else
-    echo "==> Starting preprocess in '$SERVER_NS' namespace (plain :$PROXY_PORT -> 127.0.0.1:$HTTP_PORT, -S -D)"
+    echo "==> Starting proxy in '$SERVER_NS' namespace (plain :$PROXY_PORT -> 127.0.0.1:$HTTP_PORT, -S -D)"
     ip netns exec "$SERVER_NS" \
-        "$PREPROCESS" -l "$PROXY_PORT" -r "127.0.0.1" -p "$HTTP_PORT" -S -D -n server &
+        "$PROXY" -l "$PROXY_PORT" -r "127.0.0.1" -p "$HTTP_PORT" -S -D -n server &
 fi
 SERVER_PROXY_PID=$!
 
@@ -138,25 +138,25 @@ SERVER_PROXY_PID=$!
 sleep 0.3
 
 # ---------------------------------------------------------------------------
-# 4. Start preprocess in the client namespace
+# 4. Start proxy in the client namespace
 # ---------------------------------------------------------------------------
 # Client-side proxy: accepts plain data from curl, frames it toward the
 # server-side proxy (-F), optionally over TLS (-R).
 if [[ -n "$USE_TLS" ]]; then
-    echo "==> Starting preprocess in '$CLIENT_NS' namespace (plain listener :$PROXY_PORT -> $SERVER_IP:$PROXY_PORT TLS, -F)"
+    echo "==> Starting proxy in '$CLIENT_NS' namespace (plain listener :$PROXY_PORT -> $SERVER_IP:$PROXY_PORT TLS, -F)"
     ip netns exec "$CLIENT_NS" \
-        "$PREPROCESS" -l "$PROXY_PORT" -r "$SERVER_IP" -p "$PROXY_PORT" -R -F -n client &
+        "$PROXY" -l "$PROXY_PORT" -r "$SERVER_IP" -p "$PROXY_PORT" -R -F -n client &
 else
-    echo "==> Starting preprocess in '$CLIENT_NS' namespace (plain :$PROXY_PORT -> $SERVER_IP:$PROXY_PORT, -F)"
+    echo "==> Starting proxy in '$CLIENT_NS' namespace (plain :$PROXY_PORT -> $SERVER_IP:$PROXY_PORT, -F)"
     ip netns exec "$CLIENT_NS" \
-        "$PREPROCESS" -l "$PROXY_PORT" -r "$SERVER_IP" -p "$PROXY_PORT" -F -n client &
+        "$PROXY" -l "$PROXY_PORT" -r "$SERVER_IP" -p "$PROXY_PORT" -F -n client &
 fi
 CLIENT_PROXY_PID=$!
 
 echo ""
 echo "==> Setup complete (TLS between proxies: ${USE_TLS:+yes}${USE_TLS:-no})."
-echo "    Server-side preprocess PID : $SERVER_PROXY_PID"
-echo "    Client-side preprocess PID : $CLIENT_PROXY_PID"
+echo "    Server-side proxy PID : $SERVER_PROXY_PID"
+echo "    Client-side proxy PID : $CLIENT_PROXY_PID"
 echo ""
 echo "Start the HTTP server in the server namespace:"
 echo ""
