@@ -1,7 +1,7 @@
 CC      ?= gcc
 CFLAGS  := -Wall -Wextra -Wpedantic -std=c11 \
            -D_GNU_SOURCE \
-           -O2 -g
+           -O3 -g
 
 SRC_DIR := src
 SRCS    := $(SRC_DIR)/main.c $(SRC_DIR)/geneve.c

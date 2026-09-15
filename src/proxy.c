@@ -75,11 +75,18 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+
+static int Debug;
+
+#define FRAME_HDR_SIZE  3
+
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
 /* ------------------------------------------------------------------ */
 
-#define BUF_SIZE        16384       /* relay buffer (bytes)            */
+//#define BUF_SIZE        16384       /* relay buffer (bytes)            */
+//#define BUF_SIZE        (4096 - FRAME_HDR_SIZE)       /* relay buffer (bytes)            */
+#define BUF_SIZE        4096
 #define LISTEN_BACKLOG  8           /* accept() queue depth            */
 
 /* Default paths for the local-side TLS certificate and private key.
@@ -175,7 +182,7 @@ static int parse_args(int argc, char *argv[], proxy_cfg_t *cfg)
     int port_set   = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "l:r:p:LRFSCDn:h")) != -1) {
+    while ((opt = getopt(argc, argv, "l:r:p:LRFSCDGn:h")) != -1) {
         switch (opt) {
 
         case 'l': {
@@ -240,7 +247,9 @@ static int parse_args(int argc, char *argv[], proxy_cfg_t *cfg)
         case 'D':
             cfg->deferred_upstream = 1;
             break;
-
+        case 'G':
+            Debug = 1;
+            break;
         case 'n':
             strncpy(cfg->name, optarg, sizeof(cfg->name) - 1);
             cfg->name[sizeof(cfg->name) - 1] = '\0';
@@ -475,7 +484,6 @@ typedef struct __attribute__((packed)) {
     uint8_t data[BUF_SIZE];
 } frame_t;
 
-#define FRAME_HDR_SIZE  3
 
 /* ------------------------------------------------------------------ */
 /* Low-level exact-read helpers                                        */
@@ -593,7 +601,9 @@ static read_result_t read_framed_plain_to_plain(int src_fd, int dst_fd,
     uint16_t data_len = ((uint16_t)frame.len_hi << 8) | frame.len_lo;
 
     if (frame.ctrl == CTRL_DISCONNECT) {
-        fprintf(stderr, "%s: received DISCONNECT from downstream\n", log_prefix);
+        if (Debug) {
+            fprintf(stderr, "%s: received DISCONNECT from downstream\n", log_prefix);
+        }
         return close_on_disconnect ? READ_DISCONNECT : READ_OK;
     }
 
@@ -620,7 +630,9 @@ static read_result_t read_framed_ssl_to_plain(SSL *src_ssl, int dst_fd,
     uint16_t data_len = ((uint16_t)frame.len_hi << 8) | frame.len_lo;
 
     if (frame.ctrl == CTRL_DISCONNECT) {
-        fprintf(stderr, "%s: received DISCONNECT from downstream\n", log_prefix);
+        if (Debug) {
+            fprintf(stderr, "%s: received DISCONNECT from downstream\n", log_prefix);
+        }
         return close_on_disconnect ? READ_DISCONNECT : READ_OK;
     }
 
@@ -646,7 +658,9 @@ static read_result_t read_framed_ssl_to_ssl(SSL *src_ssl, SSL *dst_ssl,
     uint16_t data_len = ((uint16_t)frame.len_hi << 8) | frame.len_lo;
 
     if (frame.ctrl == CTRL_DISCONNECT) {
-        fprintf(stderr, "%s: received DISCONNECT from downstream\n", log_prefix);
+        if (Debug) {
+            fprintf(stderr, "%s: received DISCONNECT from downstream\n", log_prefix);
+        }
         return close_on_disconnect ? READ_DISCONNECT : READ_OK;
     }
 
@@ -675,7 +689,9 @@ static read_result_t read_framed_plain_to_ssl(int src_fd, SSL *dst_ssl,
     uint16_t data_len = ((uint16_t)frame.len_hi << 8) | frame.len_lo;
 
     if (frame.ctrl == CTRL_DISCONNECT) {
-        fprintf(stderr, "%s: received DISCONNECT from downstream\n", log_prefix);
+        if (Debug) {
+            fprintf(stderr, "%s: received DISCONNECT from downstream\n", log_prefix);
+        }
         return close_on_disconnect ? READ_DISCONNECT : READ_OK;
     }
 
@@ -787,7 +803,7 @@ static relay_closed_t relay_plain_tls(int client_fd, SSL *upstream_ssl,
     int upstream_fd = SSL_get_fd(upstream_ssl);
     int maxfd = (client_fd > upstream_fd ? client_fd : upstream_fd) + 1;
     relay_closed_t reason = RELAY_DOWNSTREAM;
-
+    int client_active = 0;
     while (running) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -803,6 +819,7 @@ static relay_closed_t relay_plain_tls(int client_fd, SSL *upstream_ssl,
 
         /* plain client → TLS upstream */
         if (rc > 0 && FD_ISSET(client_fd, &rfds)) {
+            client_active = 1;
             if (use_framing) {
                 ssize_t n = read(client_fd, buf + FRAME_HDR_SIZE, BUF_SIZE);
                 if (n <= 0) { reason = RELAY_DOWNSTREAM; break; }
@@ -827,7 +844,7 @@ static relay_closed_t relay_plain_tls(int client_fd, SSL *upstream_ssl,
         }
 
         /* TLS upstream → plain client — always plain passthrough */
-        if (rc > 0 && FD_ISSET(upstream_fd, &rfds)) {
+        if (client_active && rc > 0 && FD_ISSET(upstream_fd, &rfds)) {
             int n = SSL_read(upstream_ssl, buf, BUF_SIZE);
             if (n <= 0) {
                 int err = SSL_get_error(upstream_ssl, n);
@@ -1036,14 +1053,18 @@ static void relay_deferred_plain(int client_fd, SSL *client_ssl,
 
             if (frame.ctrl == CTRL_DISCONNECT) {
                 /* DISCONNECT while idle: no backend to close, just log */
-                fprintf(stderr, "%s: received DISCONNECT (idle — no backend)\n",
-                        log_prefix);
+                if (Debug) {
+                    fprintf(stderr, "%s: received DISCONNECT (idle — no backend)\n",
+                            log_prefix);
+                }
                 continue;
             }
 
             /* DATA frame: open backend connection now */
-            fprintf(stderr, "%s: first data received — connecting to backend %s:%u\n",
-                    log_prefix, remote_ip, remote_port);
+            if (Debug) {
+                fprintf(stderr, "%s: first data received — connecting to backend %s:%u\n",
+                        log_prefix, remote_ip, remote_port);
+            }
             backend_fd = connect_to_remote(remote_ip, remote_port);
             if (backend_fd < 0) {
                 fprintf(stderr, "%s: backend connect failed — discarding %u bytes\n",
@@ -1138,8 +1159,10 @@ static void relay_deferred_plain(int client_fd, SSL *client_ssl,
                 uint16_t data_len = ((uint16_t)frame.len_hi << 8) | frame.len_lo;
 
                 if (frame.ctrl == CTRL_DISCONNECT) {
-                    fprintf(stderr, "%s: received DISCONNECT — closing backend\n",
-                            log_prefix);
+                    if (Debug) {
+                        fprintf(stderr, "%s: received DISCONNECT — closing backend\n",
+                                log_prefix);
+                    }
                     if (backend_ssl) SSL_free(backend_ssl); else close(backend_fd);
                     backend_fd  = -1;
                     backend_ssl = NULL;
@@ -1352,8 +1375,10 @@ int main(int argc, char *argv[])
             inet_ntop(AF_INET6, &s->sin6_addr, peer_str, sizeof(peer_str));
             peer_port = ntohs(s->sin6_port);
         }
-        fprintf(stderr, "%s: accepted connection from %s:%u\n",
-                log_prefix, peer_str, peer_port);
+        if (Debug) {
+            fprintf(stderr, "%s: accepted connection from %s:%u\n",
+                    log_prefix, peer_str, peer_port);
+        }
 
         /* Optionally perform TLS handshake on the incoming connection */
         SSL *client_ssl = NULL;
@@ -1376,8 +1401,10 @@ int main(int argc, char *argv[])
             relay_deferred_plain(client_fd, client_ssl,
                                  cfg.remote_ip, cfg.remote_port,
                                  cfg.use_tls_remote, NULL);
-            fprintf(stderr, "%s: inter-proxy connection from %s:%u closed\n",
-                    log_prefix, peer_str, peer_port);
+            if (Debug) {
+                fprintf(stderr, "%s: inter-proxy connection from %s:%u closed\n",
+                        log_prefix, peer_str, peer_port);
+            }
             if (client_ssl) SSL_free(client_ssl); else close(client_fd);
             /* Loop back to accept the next inter-proxy connection */
             continue;
@@ -1402,13 +1429,16 @@ int main(int argc, char *argv[])
                                    cfg.use_framing, cfg.strip_framing,
                                    cfg.close_upstream);
 
-        fprintf(stderr, "%s: connection from %s:%u closed (%s)\n",
-                log_prefix, peer_str, peer_port,
-                closed == RELAY_UPSTREAM ? "upstream closed" : "downstream closed");
-
+        if (Debug) {
+            fprintf(stderr, "%s: connection from %s:%u closed (%s)\n",
+                    log_prefix, peer_str, peer_port,
+                    closed == RELAY_UPSTREAM ? "upstream closed" : "downstream closed");
+        }
         /* Notify upstream that the downstream connection is gone (framing only) */
         if (cfg.use_framing && closed == RELAY_DOWNSTREAM) {
-            fprintf(stderr, "%s: sending DISCONNECT to upstream\n", log_prefix);
+            if (Debug) {
+                fprintf(stderr, "%s: sending DISCONNECT to upstream\n", log_prefix);
+            }
             if (upstream_ssl) {
                 uint8_t hdr[FRAME_HDR_SIZE];
                 write_framed_ssl(upstream_ssl, CTRL_DISCONNECT, hdr, 0);
