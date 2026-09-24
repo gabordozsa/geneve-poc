@@ -41,8 +41,8 @@ set -euo pipefail
 IPERF="/home/ubuntu/iperf2/src/iperf"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROXY="$SCRIPT_DIR/proxy"
-CERTS_DIR="$SCRIPT_DIR/certs"
+PROXY="$SCRIPT_DIR/../proxy"
+CERTS_DIR="$SCRIPT_DIR/../certs"
 USE_TLS="${USE_TLS:-1}"          # set to any non-empty value to enable TLS between proxies
 
 CLIENT_NS="client"
@@ -118,45 +118,38 @@ ip netns exec "$SERVER_NS" ip link set "$VETH_SERVER" up
 ip netns exec "$SERVER_NS" ip link set lo up
 
 # ---------------------------------------------------------------------------
-# 3. Start proxy in the server namespace
+# 3. Print proxy commands
 # ---------------------------------------------------------------------------
 # Server-side proxy: receives framed data from the client-side proxy (-S to strip
-# the control byte from upstream data), closes the upstream connection on DISCONNECT
-# frames (-C), and forwards plain data to the HTTP server.
+# the control byte from upstream data) and forwards plain data to the HTTP server.
 if [[ -n "$USE_TLS" ]]; then
-    echo "==> Starting proxy in '$SERVER_NS' namespace (TLS listener :$PROXY_PORT -> 127.0.0.1:$HTTP_PORT plain, -S -D)"
-    ip netns exec "$SERVER_NS" \
-        "$PROXY" -l "$PROXY_PORT" -r "127.0.0.1" -p "$HTTP_PORT" -L -S -D -n server &
+    SERVER_PROXY_CMD=(ip netns exec "$SERVER_NS" "$PROXY" -l "$PROXY_PORT" -r "127.0.0.1" -p "$HTTP_PORT" -L -S -D -n server)
 else
-    echo "==> Starting proxy in '$SERVER_NS' namespace (plain :$PROXY_PORT -> 127.0.0.1:$HTTP_PORT, -S -D)"
-    ip netns exec "$SERVER_NS" \
-        "$PROXY" -l "$PROXY_PORT" -r "127.0.0.1" -p "$HTTP_PORT" -S -D -n server &
+    SERVER_PROXY_CMD=(ip netns exec "$SERVER_NS" "$PROXY" -l "$PROXY_PORT" -r "127.0.0.1" -p "$HTTP_PORT" -S -D -n server)
 fi
-SERVER_PROXY_PID=$!
 
-# Give the server-side proxy a moment to bind before the client connects.
-sleep 0.3
-
-# ---------------------------------------------------------------------------
-# 4. Start proxy in the client namespace
-# ---------------------------------------------------------------------------
 # Client-side proxy: accepts plain data from curl, frames it toward the
 # server-side proxy (-F), optionally over TLS (-R).
 if [[ -n "$USE_TLS" ]]; then
-    echo "==> Starting proxy in '$CLIENT_NS' namespace (plain listener :$PROXY_PORT -> $SERVER_IP:$PROXY_PORT TLS, -F)"
-    ip netns exec "$CLIENT_NS" \
-        "$PROXY" -l "$PROXY_PORT" -r "$SERVER_IP" -p "$PROXY_PORT" -R -F -n client &
+    CLIENT_PROXY_CMD=(ip netns exec "$CLIENT_NS" "$PROXY" -l "$PROXY_PORT" -r "$SERVER_IP" -p "$PROXY_PORT" -R -F -n client)
 else
-    echo "==> Starting proxy in '$CLIENT_NS' namespace (plain :$PROXY_PORT -> $SERVER_IP:$PROXY_PORT, -F)"
-    ip netns exec "$CLIENT_NS" \
-        "$PROXY" -l "$PROXY_PORT" -r "$SERVER_IP" -p "$PROXY_PORT" -F -n client &
+    CLIENT_PROXY_CMD=(ip netns exec "$CLIENT_NS" "$PROXY" -l "$PROXY_PORT" -r "$SERVER_IP" -p "$PROXY_PORT" -F -n client)
 fi
-CLIENT_PROXY_PID=$!
 
 echo ""
 echo "==> Setup complete (TLS between proxies: ${USE_TLS:+yes}${USE_TLS:-no})."
-echo "    Server-side proxy PID : $SERVER_PROXY_PID"
-echo "    Client-side proxy PID : $CLIENT_PROXY_PID"
+echo ""
+echo "Start the server-side proxy in a separate terminal:"
+echo ""
+printf '    '
+printf '%q ' "${SERVER_PROXY_CMD[@]}"
+echo ""
+echo ""
+echo "Start the client-side proxy in a separate terminal:"
+echo ""
+printf '    '
+printf '%q ' "${CLIENT_PROXY_CMD[@]}"
+echo ""
 echo ""
 echo "Start the HTTP server in the server namespace:"
 echo ""
@@ -174,9 +167,9 @@ echo "Run iperf client from the client namespace (connecting through the client 
 echo ""
 echo "    sudo ip netns exec $CLIENT_NS $IPERF -c 127.0.0.1 -p $PROXY_PORT"
 echo ""
-echo "Press Ctrl-C to tear down the namespaces and stop the proxies."
+echo "Press Enter to tear down the namespaces and veth pair."
 
 # ---------------------------------------------------------------------------
-# 6. Wait until the user interrupts
+# 6. Wait until the user tears down the test environment
 # ---------------------------------------------------------------------------
-wait
+read -r

@@ -82,7 +82,8 @@ static int Debug;
 /* Constants                                                           */
 /* ------------------------------------------------------------------ */
 
-#define BUF_SIZE        4096
+//#define BUF_SIZE        4096
+#define BUF_SIZE        16384
 #define LISTEN_BACKLOG  8           /* accept() queue depth            */
 
 /* Default paths for the local-side TLS certificate and private key.
