@@ -7,13 +7,7 @@
 struct geneve_opt_custom {
     __be16  opt_class;
     __u8    type;
-#if defined(__BIG_ENDIAN_BITFIELD)
-    __u8    rsvd:3,
-            length:5;
-#elif defined(__LITTLE_ENDIAN_BITFIELD)
-    __u8    length:5,
-            rsvd:3;
-#endif
+    __u8    length_rsvd; // Replaces the risky bitfield union
     __u32   opt_data;
 };
 
@@ -45,13 +39,6 @@ struct {
  * The Geneve driver has already decapsulated the packet and attached tunnel
  * metadata (VNI, outer IPs, Geneve options) to the skb before this runs.
  *
- * Logic:
- *   - Read the Geneve option.  If class/type don't match, pass up normally.
- *   - If opt_data == 300 (0x12C): local delivery — pass to the stack (TC_ACT_OK).
- *   - Otherwise: redirect the packet to the EGRESS path of the same interface
- *     (bpf_redirect with flag 0 = egress).  The tunnel metadata is still
- *     attached to the skb and will be read by the egress eBPF program.
- *     No tunnel key modification is done here.
  */
 SEC("tc/ingress")
 int geneve_ingress_redirect(struct __sk_buff *skb)
@@ -67,86 +54,85 @@ int geneve_ingress_redirect(struct __sk_buff *skb)
 
     __u32 opt_val = bpf_ntohl(opt.opt_data);
 
+    bpf_printk("ingress: CB old mark: %d", skb->mark);
+    skb->mark = opt_val;
+
     // opt_val 300 (0x12C) means local delivery — do not relay
     if (opt_val == 300)
         return TC_ACT_OK;
 
+    // Read current tunnel key to preserve VNI and other fields
+    struct bpf_tunnel_key cur_tkey = {};
+    if (bpf_skb_get_tunnel_key(skb, &cur_tkey, sizeof(cur_tkey), 0) < 0) {
+        bpf_printk("ingress: get_tunnel_key failed, dropping");
+        return TC_ACT_SHOT;
+    }
+    bpf_printk("ingress: local_ip: %d remote_ipv: %d, vni: %d tl: %d", cur_tkey.local_ipv4, cur_tkey.remote_ipv4, cur_tkey.tunnel_id, cur_tkey.tunnel_ttl);
+
     // Redirect to this device's own egress path.
-    // The egress eBPF program will rewrite the tunnel key, then
-    // the TC "tunnel_key unset" filter will commit it so the Geneve
-    // driver builds the new outer header.
-    bpf_printk("ingress: opt=%u, redirecting to egress ifindex %u",
+    // The egress eBPF program will rewrite the tunnel key
+    bpf_printk("ingress: opt=%u, cloning/redirecting to egress ifindex %u",
                opt_val, skb->ifindex);
-    return bpf_redirect(skb->ifindex, 0);
+
+    int ret = bpf_redirect(skb->ifindex, 0); 
+    if (ret != TC_ACT_REDIRECT) {
+        bpf_printk("ingress: redirect failed");
+    } else {
+        bpf_printk("ingress: redirect OK");
+    }
+    return ret; 
 }
 
 /* ── Egress program ───────────────────────────────────────────────────────────
  *
  * Attached to TC egress of geneve-in at a lower pref (higher priority number)
  * than the "tunnel_key unset" TC filter, so it runs FIRST.
- *
- * Must be attached with a lower pref value than the tunnel_key unset filter.
- * user_control attaches this eBPF at pref 1; the TC tunnel_key unset is
- * added at pref 2 via a shell command after user_control runs.
- *
- * Logic:
- *   - Read the Geneve option from the skb metadata (still present from ingress
- *     decap, carried through bpf_redirect).
- *   - Look up the new outer IPs in geneve_routes.
- *   - Call bpf_skb_set_tunnel_key to rewrite src/dst IPs (VNI and opts intact).
- *   - Return TC_ACT_PIPE so the next filter ("tunnel_key unset") runs and
- *     commits the metadata to the Geneve driver for re-encapsulation.
  */
 SEC("tc/egress")
 int geneve_egress_rewrite(struct __sk_buff *skb)
 {
     struct geneve_opt_custom opt = {};
+    struct route_entry default_route = {
+        .remote_ipv4 = 0x0A000103,
+        .local_ipv4 = 0x0A000102
+    };
 
-    // The tunnel metadata written during ingress decap is still present on
-    // the skb after bpf_redirect to the same device's egress.
-    int len = bpf_skb_get_tunnel_opt(skb, &opt, sizeof(opt));
-    if (len < (int)sizeof(struct geneve_opt_custom)) {
-        bpf_printk("egress: no tunnel opt, passing");
-        return TC_ACT_OK;
-    }
+    __u32 my_opt = skb->mark;
+    bpf_printk("egress: CB  mark: %d", my_opt);
 
-    if (bpf_ntohs(opt.opt_class) != 0x0101 || opt.type != 0x2A) {
-        bpf_printk("egress: opt class/type mismatch, passing");
-        return TC_ACT_OK;
-    }
-
-    __u32 opt_val = bpf_ntohl(opt.opt_data);
-
-    struct route_entry *route = bpf_map_lookup_elem(&geneve_routes, &opt_val);
+    struct route_entry *route = bpf_map_lookup_elem(&geneve_routes, &my_opt);
     if (!route) {
-        bpf_printk("egress: no route for opt=%u, dropping", opt_val);
-        return TC_ACT_SHOT;
+        bpf_printk("egress: no route for opt=%u, using default", my_opt);
+        route = &default_route;
+        //return TC_ACT_SHOT;
     }
 
-    // Read current tunnel key to preserve VNI and other fields
     struct bpf_tunnel_key tkey = {};
-    if (bpf_skb_get_tunnel_key(skb, &tkey, sizeof(tkey), 0) < 0) {
-        bpf_printk("egress: get_tunnel_key failed, dropping");
-        return TC_ACT_SHOT;
-    }
-    bpf_printk("egress: local_ip: %d remote_ipv: %d, vni: %d tl: %d", tkey.local_ipv4, tkey.remote_ipv4, tkey.tunnel_id, tkey.tunnel_ttl);
-
-    // Rewrite outer IPs only; VNI and Geneve opts are untouched
-    tkey.local_ipv4  = route->local_ipv4;
     tkey.remote_ipv4 = route->remote_ipv4;
+    // tkey.local_ipv4 = route->local_ipv4;
+    tkey.tunnel_id = 42;
+    tkey.tunnel_ttl = 64;
 
-    if (bpf_skb_set_tunnel_key(skb, &tkey, sizeof(tkey), BPF_F_ZERO_CSUM_TX) < 0) {
+    if (bpf_skb_set_tunnel_key(skb, &tkey, sizeof(tkey), 0) < 0) {
         bpf_printk("egress: set_tunnel_key failed, dropping");
         return TC_ACT_SHOT;
     }
 
-    bpf_printk("egress: opt=%u rewrote outer IPs, piping to tunnel_key unset",
-               opt_val);
+    struct geneve_opt_custom gen_opt = {};
+    gen_opt.opt_class = bpf_htons((0x0101));
+    gen_opt.type = 0x2A;
+    gen_opt.opt_data = bpf_htonl(my_opt);
+    gen_opt.length_rsvd = 1 & 0x1F;
 
-    // TC_ACT_PIPE: pass to the next filter in the egress chain.
-    // The "tunnel_key unset" TC filter at the next pref will commit the
-    // metadata so the Geneve driver builds the outer UDP/IP header.
-    return TC_ACT_PIPE;
+    int ret = bpf_skb_set_tunnel_opt(skb, &gen_opt, sizeof(gen_opt));
+    if (ret < 0) {
+        bpf_printk("egress: Failed to set Geneve option: %d\n", ret);
+        return TC_ACT_SHOT; // Drop packet on error, or return TC_ACT_OK based on intent
+    }
+
+    bpf_printk("egress: packet completed (opt: %d)", my_opt);
+
+    return TC_ACT_OK;
 }
 
 char _license[] SEC("license") = "GPL";
