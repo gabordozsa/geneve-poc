@@ -13,10 +13,24 @@
  * local_ipv4  — new outer source IP for the egress leg
  * remote_ipv4 — new outer destination IP for the egress leg
  */
-struct route_entry {
-    uint32_t local_ipv4;
-    uint32_t remote_ipv4;
+union ip4 {
+    uint32_t num;
+    unsigned char octets[4];
 };
+
+struct route_entry {
+    union ip4 local_ipv4;
+    union ip4 remote_ipv4;
+};
+
+static int ip4_ptoh(const char *p, union ip4 *r) {
+    int n = sscanf(p, "%hhu.%hhu.%hhu.%hhu", r->octets + 3, r->octets + 2, r->octets + 1, r->octets);
+    if (n != 4) {
+        fprintf(stderr, "(E) ip4_ptoh() %s n %d", p, n);
+        return -1;
+    }
+    return 0;
+}
 
 static int update_route(int map_fd, uint32_t option_val,
                         const char *local_ip_str, const char *remote_ip_str)
@@ -24,11 +38,11 @@ static int update_route(int map_fd, uint32_t option_val,
     uint32_t key = option_val;
     struct route_entry value = {};
 
-    if (inet_pton(AF_INET, local_ip_str, &value.local_ipv4) != 1) {
+    if (ip4_ptoh(local_ip_str, &value.local_ipv4) < 0) {
         fprintf(stderr, "[-] Invalid local IP: %s\n", local_ip_str);
         return -1;
     }
-    if (inet_pton(AF_INET, remote_ip_str, &value.remote_ipv4) != 1) {
+    if (ip4_ptoh(remote_ip_str, &value.remote_ipv4) < 0) {
         fprintf(stderr, "[-] Invalid remote IP: %s\n", remote_ip_str);
         return -1;
     }
@@ -36,8 +50,8 @@ static int update_route(int map_fd, uint32_t option_val,
         perror("[-] bpf_map_update_elem");
         return -1;
     }
-    printf("[+] Route: opt %-3u  src %-15s  dst %s\n",
-           option_val, local_ip_str, remote_ip_str);
+    printf("[+] Route: opt %-3u  src %-15s 0x%-8x dst %s 0x%-8x\n",
+           option_val, local_ip_str, value.local_ipv4.num ,remote_ip_str, value.remote_ipv4.num);
     return 0;
 }
 
@@ -137,11 +151,7 @@ int main(int argc, char **argv)
     /*
      * TC pref (priority) ordering on the egress chain:
      *   pref 1 — geneve_egress_rewrite  (eBPF, returns TC_ACT_PIPE)
-     *   pref 2 — tunnel_key unset       (TC action, added by the shell below)
      *
-     * Filters are executed in ascending pref order.  TC_ACT_PIPE from the eBPF
-     * passes control to the next filter (tunnel_key unset), which commits the
-     * metadata so the Geneve driver builds the outer UDP/IP header.
      */
     struct bpf_tc_hook egress_hook;
     struct bpf_tc_opts egress_opts;
@@ -155,9 +165,6 @@ int main(int argc, char **argv)
     printf("[+] Egress  eBPF attached (pref 1) on %s\n", iface);
 
     printf("\n");
-    printf("Now add the egress 'tunnel_key unset' filter at pref 2:\n");
-    printf("  tc filter add dev %s egress pref 2 protocol ip matchall"
-           " action tunnel_key unset pass\n", iface);
     printf("\nPress Enter to detach and stop...\n");
     getchar();
 

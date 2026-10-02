@@ -109,7 +109,7 @@ int geneve_egress_rewrite(struct __sk_buff *skb)
 
     struct bpf_tunnel_key tkey = {};
     tkey.remote_ipv4 = route->remote_ipv4;
-    // tkey.local_ipv4 = route->local_ipv4;
+    // tkey.local_ipv4 = route->local_ipv4; No need, this is set by the driver based on the rout src
     tkey.tunnel_id = 42;
     tkey.tunnel_ttl = 64;
 
