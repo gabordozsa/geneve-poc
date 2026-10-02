@@ -32,6 +32,9 @@ struct {
     __type(value, struct route_entry);
 } geneve_routes SEC(".maps");
 
+/* Global variable set from user-space at load-time */
+const volatile __u32 LOCAL_ROUTING_KEY = 300;
+
 /* ── Ingress program ──────────────────────────────────────────────────────────
  *
  * Attached to TC ingress of geneve-in.
@@ -57,8 +60,8 @@ int geneve_ingress_redirect(struct __sk_buff *skb)
     bpf_printk("ingress: CB old mark: %d", skb->mark);
     skb->mark = opt_val;
 
-    // opt_val 300 (0x12C) means local delivery — do not relay
-    if (opt_val == 300)
+    // opt_val LOCAL_ROUTING_KEY means local delivery — do not relay
+    if (opt_val == LOCAL_ROUTING_KEY)
         return TC_ACT_OK;
 
     // Read current tunnel key to preserve VNI and other fields

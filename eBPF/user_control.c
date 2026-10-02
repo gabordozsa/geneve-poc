@@ -1,12 +1,81 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <signal.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <libelf.h>
+#include <gelf.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
 #define MY_EBPF_OBJ "redirect_map.o"
+
+/* ── Signal handling ─────────────────────────────────────────────────────── */
+static volatile sig_atomic_t g_stop = 0;
+
+static struct bpf_tc_hook g_ingress_hook;
+static struct bpf_tc_opts g_ingress_opts;
+static struct bpf_tc_hook g_egress_hook;
+static struct bpf_tc_opts g_egress_opts;
+static struct bpf_object  *g_obj = NULL;
+
+static void sig_handler(int sig)
+{
+    (void)sig;
+    g_stop = 1;
+}
+
+static int get_symbol_offset(const char *elf_path, const char *sym_name, size_t *offset_out) {
+    int fd = open(elf_path, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return -1;
+    }
+
+    if (elf_version(EV_CURRENT) == EV_NONE) {
+        fprintf(stderr, "ELF library initialization failed\n");
+        close(fd);
+        return -1;
+    }
+
+    Elf *elf = elf_begin(fd, ELF_C_READ, NULL);
+    if (!elf) {
+        fprintf(stderr, "elf_begin failed: %s\n", elf_errmsg(-1));
+        close(fd);
+        return -1;
+    }
+
+    Elf_Scn *scn = NULL;
+    GElf_Shdr shdr;
+    Elf_Data *data = NULL;
+    int ret = -1;
+
+    while ((scn = elf_nextscn(elf, scn)) != NULL) {
+        gelf_getshdr(scn, &shdr);
+        if (shdr.sh_type == SHT_SYMTAB) {
+            data = elf_getdata(scn, NULL);
+            int count = shdr.sh_size / shdr.sh_entsize;
+            for (int i = 0; i < count; i++) {
+                GElf_Sym sym;
+                gelf_getsym(data, i, &sym);
+                char *name = elf_strptr(elf, shdr.sh_link, sym.st_name);
+                if (name && strcmp(name, sym_name) == 0) {
+                    *offset_out = sym.st_value;
+                    ret = 0;
+                    goto cleanup;
+                }
+            }
+        }
+    }
+
+cleanup:
+    elf_end(elf);
+    close(fd);
+    return ret;
+}
 
 /*
  * Must mirror the struct in redirect_map.c exactly.
@@ -87,8 +156,8 @@ static int tc_attach_bpf(unsigned int ifindex, int attach_point,
 
 int main(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <iface>  (e.g. geneve-in)\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <iface> <local_routing_key> (e.g. geneve-in 300)\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -99,12 +168,57 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    uint32_t local_routing_key = (uint32_t)strtoul(argv[2], NULL, 10);
+
     /* ── 1. Load eBPF object ─────────────────────────────────────────────── */
     struct bpf_object *obj = bpf_object__open_file(MY_EBPF_OBJ, NULL);
     if (libbpf_get_error(obj)) {
         fprintf(stderr, "[-] bpf_object__open_file\n");
         return EXIT_FAILURE;
     }
+
+    /* Set global variable LOCAL_ROUTING_KEY in .rodata before loading */
+    struct bpf_map *rodata_map = NULL;
+    struct bpf_map *map;
+    bpf_object__for_each_map(map, obj) {
+        const char *name = bpf_map__name(map);
+        if (strstr(name, ".rodata")) {
+            rodata_map = map;
+            break;
+        }
+    }
+
+    if (!rodata_map) {
+        fprintf(stderr, "[-] .rodata map not found in eBPF object. Make sure LOCAL_ROUTING_KEY is defined.\n");
+        bpf_object__close(obj);
+        return EXIT_FAILURE;
+    }
+
+    size_t rodata_sz;
+    void *rodata_data = bpf_map__initial_value(rodata_map, &rodata_sz);
+    if (!rodata_data) {
+        fprintf(stderr, "[-] bpf_map__initial_value failed to get .rodata map pointer\n");
+        bpf_object__close(obj);
+        return EXIT_FAILURE;
+    }
+
+    size_t key_offset = 0;
+    if (get_symbol_offset(MY_EBPF_OBJ, "LOCAL_ROUTING_KEY", &key_offset) < 0) {
+        fprintf(stderr, "[-] Failed to find offset of LOCAL_ROUTING_KEY in ELF symbol table\n");
+        bpf_object__close(obj);
+        return EXIT_FAILURE;
+    }
+
+    if (key_offset + sizeof(uint32_t) > rodata_sz) {
+        fprintf(stderr, "[-] LOCAL_ROUTING_KEY offset (%zu) out of .rodata boundaries (%zu bytes)\n", key_offset, rodata_sz);
+        bpf_object__close(obj);
+        return EXIT_FAILURE;
+    }
+
+    // Set LOCAL_ROUTING_KEY at its resolved offset
+    *(uint32_t *)((char *)rodata_data + key_offset) = local_routing_key;
+    printf("[+] Setting LOCAL_ROUTING_KEY to %u in .rodata (offset: %zu)\n", local_routing_key, key_offset);
+
     if (bpf_object__load(obj)) {
         fprintf(stderr, "[-] bpf_object__load\n");
         bpf_object__close(obj);
@@ -136,41 +250,46 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    /* ── 4. Attach ingress eBPF ──────────────────────────────────────────── */
-    struct bpf_tc_hook ingress_hook;
-    struct bpf_tc_opts ingress_opts;
+    /* ── 4. Register SIGINT handler ─────────────────────────────────────── */
+    struct sigaction sa = {};
+    sa.sa_handler = sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+
+    /* ── 5. Attach ingress eBPF ──────────────────────────────────────────── */
+    g_obj = obj;
     if (tc_attach_bpf(ifindex, BPF_TC_INGRESS,
                       bpf_program__fd(ingress_prog), 1,
-                      &ingress_hook, &ingress_opts) < 0) {
+                      &g_ingress_hook, &g_ingress_opts) < 0) {
         bpf_object__close(obj);
         return EXIT_FAILURE;
     }
     printf("[+] Ingress eBPF attached (pref 1) on %s\n", iface);
 
-    /* ── 5. Attach egress eBPF at pref 1 ─────────────────────────────────── */
+    /* ── 6. Attach egress eBPF at pref 1 ─────────────────────────────────── */
     /*
      * TC pref (priority) ordering on the egress chain:
      *   pref 1 — geneve_egress_rewrite  (eBPF, returns TC_ACT_PIPE)
      *
      */
-    struct bpf_tc_hook egress_hook;
-    struct bpf_tc_opts egress_opts;
     if (tc_attach_bpf(ifindex, BPF_TC_EGRESS,
                       bpf_program__fd(egress_prog), 1,
-                      &egress_hook, &egress_opts) < 0) {
-        bpf_tc_detach(&ingress_hook, &ingress_opts);
+                      &g_egress_hook, &g_egress_opts) < 0) {
+        bpf_tc_detach(&g_ingress_hook, &g_ingress_opts);
         bpf_object__close(obj);
         return EXIT_FAILURE;
     }
     printf("[+] Egress  eBPF attached (pref 1) on %s\n", iface);
 
-    printf("\n");
-    printf("\nPress Enter to detach and stop...\n");
-    getchar();
+    printf("\nRunning — press Ctrl-C to detach and stop...\n");
+    while (!g_stop)
+        pause();
 
-    /* ── 6. Cleanup ──────────────────────────────────────────────────────── */
-    bpf_tc_detach(&egress_hook,  &egress_opts);
-    bpf_tc_detach(&ingress_hook, &ingress_opts);
+    /* ── 7. Cleanup ──────────────────────────────────────────────────────── */
+    printf("\n[*] Caught SIGINT, cleaning up...\n");
+    bpf_tc_detach(&g_egress_hook,  &g_egress_opts);
+    bpf_tc_detach(&g_ingress_hook, &g_ingress_opts);
     bpf_object__close(obj);
     return EXIT_SUCCESS;
 }

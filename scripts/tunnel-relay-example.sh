@@ -11,6 +11,9 @@
 
 set -euo pipefail
 
+# control plane to attach and configure ingress/egress ebpf tc filters
+USER_CONTROL=/home/ubuntu/geneve-poc/eBPF/user_control
+
 # ── tunables ──────────────────────────────────────────────────────────────────
 VNI=42
 PORT=6081
@@ -89,8 +92,9 @@ ip netns exec ns-left ip link set geneve-left address "${MAC_LEFT}"
 ip netns exec ns-left ip addr add "${LEFT_OVERLAY}/24" dev geneve-left
 ip netns exec ns-left ip link set geneve-left up
 
+# We add bgp filters from user_control.c ...
+#if false; then
 info "Adding tc filter to geneve-left"
-
 ip netns exec ns-left tc qdisc add dev geneve-left root handle 1: prio
 ip netns exec ns-left tc filter add dev geneve-left protocol ip parent 1: \
     matchall \
@@ -102,6 +106,7 @@ ip netns exec ns-left tc filter add dev geneve-left protocol ip parent 1: \
         ttl     3                  \
         geneve_opts "${GENEVE_OPT_LEFT}" \
     pass
+#fi
 
 info "Creating geneve-rel"
 
@@ -119,8 +124,9 @@ ip netns exec ns-right ip link set geneve-right address "${MAC_RIGHT}"
 ip netns exec ns-right ip addr add "${RIGHT_OVERLAY}/24" dev geneve-right
 ip netns exec ns-right ip link set geneve-right up
 
+# We add bgp filters from user_control.c ...
+#if false; then
 info "Adding tc filter to geneve-right"
-
 ip netns exec ns-right tc qdisc add dev geneve-right root handle 1: prio
 ip netns exec ns-right tc filter add dev geneve-right protocol ip parent 1: \
     matchall \
@@ -132,6 +138,7 @@ ip netns exec ns-right tc filter add dev geneve-right protocol ip parent 1: \
         ttl     3                   \
         geneve_opts "${GENEVE_OPT_RIGHT}" \
     pass
+#fi
 
 # ── 5. Static ARP / neighbour entries (avoids ARP over tunnel during test) ────
 info "Adding neighbour entries"
@@ -158,11 +165,23 @@ ip netns exec ns-right ip neigh add "${RELAY_OVERLAY}" \
     lladdr "${MAC_RELAY}" dev geneve-right nud permanent
 
 # ── 6. Show the installed filter chain ───────────────────────────────────────
+if false; then
 info "tc filter chain on ns-relay geneve-rel (ingress) — UNSET path:"
 echo "  ip netns exec ns-relay tc filter show dev geneve-rel ingress"
 info "tc filter chain on ns-relay geneve-rel (egress) — UNSET path:"
 echo "  ip netns exec ns-relay tc filter show dev geneve-rel egress"
+fi
+
+
+# Attach ebpf filters to geneve-rel (ns-relay)
+pushd $(dirname $USER_CONTROL)
+ip netns exec ns-relay $USER_CONTROL geneve-rel 300 &
+uc_pid=$!
+popd
 
 echo ""
 info "Done.  Press Enter to tear down."
 read -r
+
+kill $uc_pid
+wait $uc_pid
