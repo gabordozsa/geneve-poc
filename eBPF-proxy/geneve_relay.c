@@ -11,6 +11,8 @@
 #define LOG_INFO  1
 #define LOG_ERROR 2
 
+// Current log level
+#define LOG_LEVEL LOG_ERROR
 
 // virtual network ID
 #define VNI 42
@@ -119,7 +121,7 @@ const volatile __be32 LOCAL_ID_HASH;
 const volatile __be32 LOCAL_OVERLAY_IP;
 
 // Log messages are written to /sys/kernel/tracing/trace
-#define log(level, fmt, args...) bpf_printk("[%08x] " fmt, LOCAL_ID_HASH, ##args)
+#define log(level, fmt, args...) if (level >= LOG_LEVEL) bpf_printk("[%08x] " fmt, LOCAL_ID_HASH, ##args)
 
 /* Ingress: packet reached its final destination */
 static __always_inline int local_ingress_packet(struct __sk_buff *skb, __be32 src_id_hash) {
@@ -262,7 +264,7 @@ static __always_inline int relay_ingress_packet(struct __sk_buff *skb, __be32 ds
     if (ret != TC_ACT_REDIRECT) {
         log(LOG_ERROR,"(E) ingress: redirect failed");
     } else {
-        log(LOG_ERROR,"ingress: redirect OK");
+        log(LOG_INFO,"ingress: redirect OK");
     }
     return ret;
 }
@@ -385,7 +387,7 @@ static __always_inline int local_egress_packet(struct __sk_buff *skb) {
     }
 
     __be32 old_daddr = ip->daddr; // inner dest addr
-    log(LOG_ERROR,"local_egress_packet(): old ip: %08x", old_daddr);
+    log(LOG_INFO,"local_egress_packet(): old ip: %08x", old_daddr);
     // Get the ID hash of the dest proxy
     __be32 *id_hash_ptr = bpf_map_lookup_elem(&ip2hash, &old_daddr);
     if (!id_hash_ptr) {
@@ -393,7 +395,7 @@ static __always_inline int local_egress_packet(struct __sk_buff *skb) {
         return TC_ACT_SHOT;
     }
     __be32 dest_id_hash = *id_hash_ptr;
-    log(LOG_ERROR,"(I) local_egress_packet(): dest id_hash: %08x", bpf_ntohl(dest_id_hash));
+    log(LOG_INFO,"(I) local_egress_packet(): dest id_hash: %08x", bpf_ntohl(dest_id_hash));
 
     // Get the underlay IP of the next hop
     __be32 *nh_ip_ptr = bpf_map_lookup_elem(&hash2nh, &dest_id_hash);
@@ -425,8 +427,6 @@ static __always_inline int relay_egress_packet(struct __sk_buff *skb, __u8 dst_h
     }
      __be32 src_id_hash = *id_hash_ptr;
 
-    log(LOG_ERROR,"(I) relay_egress_packet(): dest id_hash: %08x src id_hash: %08x", bpf_ntohl(dest_id_hash), bpf_ntohl(src_id_hash));
-
     // Get the underlay IP of the next hop
     __be32 *nh_ip_ptr = bpf_map_lookup_elem(&hash2nh, &dest_id_hash);
     if (!nh_ip_ptr) {
@@ -435,7 +435,7 @@ static __always_inline int relay_egress_packet(struct __sk_buff *skb, __u8 dst_h
     }
     __be32 nh_ip = *nh_ip_ptr;
 
-    log(LOG_ERROR,"(I) relay_egress_packet(): dest id_hash: %08x src id_hash: %08x", bpf_ntohl(dest_id_hash), bpf_ntohl(src_id_hash));
+    log(LOG_INFO,"(I) relay_egress_packet(): dest id_hash: %08x src id_hash: %08x", bpf_ntohl(dest_id_hash), bpf_ntohl(src_id_hash));
     return set_tunnel_key_and_opt(skb, nh_ip, dest_id_hash, src_id_hash);
 }
 
@@ -456,7 +456,7 @@ int geneve_egress_rewrite(struct __sk_buff *skb)
 
     __u8 dst_hash_index = (skb->mark >> 24);
     __u8 src_hash_index =  (skb->mark >> 16 & 0xFF);
-    log(LOG_ERROR,"egress: CB  mark: %d dst/src hash index: %d/%d", skb->mark,  dst_hash_index, src_hash_index);
+    log(LOG_INFO,"egress: CB  mark: %d dst/src hash index: %d/%d", skb->mark,  dst_hash_index, src_hash_index);
 
     if (dst_hash_index == 0) {
         // Locally created packet
