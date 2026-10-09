@@ -77,11 +77,6 @@ cleanup:
     return ret;
 }
 
-/*
- * Must mirror the struct in redirect_map.c exactly.
- * local_ipv4  — new outer source IP for the egress leg
- * remote_ipv4 — new outer destination IP for the egress leg
- */
 union ip4 {
     uint32_t num;
     unsigned char octets[4];
