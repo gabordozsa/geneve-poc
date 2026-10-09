@@ -16,9 +16,9 @@ USER_CONTROL=/home/ubuntu/geneve-poc/eBPF-proxy/user_control
 
 # ── tunables ──────────────────────────────────────────────────────────────────
 
-# Use the same overlay IP address at each site. Also, overlay IP <-> ID hash mapping for
-# remote sites is different at each site. This is to mimic router network where these mappings
-# are defined locally so, they are expected to different.
+# Use the same overlay IP address at each site. Also, overlay IP <-> ID hash mapping
+# is different at each site. This is to mimic router network where overlay IPs are
+# assigned to ID hashes independently at each site.
 
 PORT=6081
 
