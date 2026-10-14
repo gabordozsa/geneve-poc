@@ -11,6 +11,17 @@
 
 set -euo pipefail
 
+# Geneve overhead:
+# outer eth header.    14 bytes
+# outer ipv4 header    20 bytes
+# outer udp header.     8 bytes
+# Geneve base header    8 bytes
+# My custom TLV option 12 bytes
+# total 62 bytes
+# physycal iface (ens3) mtu is 1500
+MTU=1438
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { printf '\n==> %s\n' "$*"; }
@@ -120,6 +131,7 @@ info "Creating geneve0 at site $SITE"
 ip link add geneve0 type geneve dstport "${GENEVE_PORT}" external
 ip link set geneve0 address "${MAC[$SITE]}"
 ip addr add "${OVERLAY[$SITE]}/24" dev geneve0
+ip link set dev geneve0 mtu $MTU
 ip link set geneve0 up
 
 # ── 5. Static ARP / neighbour entries (avoids ARP over tunnel during test) ────
