@@ -230,13 +230,6 @@ static __always_inline int local_ingress_packet(struct __sk_buff *skb, __be32 sr
         } else {
             log(LOG_ERROR,"(I) ingress: old UDP csum is zero, skip csum fixing");
         }
-    } else if (ip->protocol == IPPROTO_ICMP) {
-        l4_csum_offset += offsetof(struct icmphdr, checksum);
-        ret = bpf_l4_csum_replace(skb, l4_csum_offset, 0, csum_diff, BPF_F_PSEUDO_HDR);
-        if (ret < 0) {
-            log(LOG_ERROR,"(E) ingress: bpf_l4_csum_replace() ICMP error: %d, dropping", ret);
-            return TC_ACT_SHOT;
-        }
     }
 
     log(LOG_INFO, "ingress: local packet is being delivered");

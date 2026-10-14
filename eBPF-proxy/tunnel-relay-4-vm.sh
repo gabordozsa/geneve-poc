@@ -106,9 +106,9 @@ MAC[VS4]="02:00:00:00:00:04"
 declare -A USER_CTRL_ARGS
 NUM_REMOTE_PROXIES=3
 USER_CTRL_ARGS[VS1]="geneve0 ${ID_HASH[VS1]} ${OVERLAY[VS1]} $NUM_REMOTE_PROXIES ${ID_HASH[VS2]} 192.168.42.2 ${UNDERLAY[VS2]} ${ID_HASH[VS3]} 192.168.42.3  ${UNDERLAY[VS2]} ${ID_HASH[VS4]} 192.168.42.4  ${UNDERLAY[VS2]}"
-USER_CTRL_ARGS[VS2]="geneve0 ${ID_HASH[VS2]} ${OVERLAY[VS2]} $NUM_REMOTE_PROXIES ${ID_HASH[VS1]} 192.168.42.1 ${UNDERLAY[VS1]} ${ID_HASH[VS3]} 192.168.42.3  ${UNDERLAY[VS3]} ${ID_HASH[VS4]} 192.168.42.24 ${UNDERLAY[VS3]}"
-USER_CTRL_ARGS[VS3]="geneve0 ${ID_HASH[VS3]} ${OVERLAY[VS3]} $NUM_REMOTE_PROXIES ${ID_HASH[VS1]} 192.168.42.1 ${UNDERLAY[VS2]} ${ID_HASH[VS2]} 192.168.42.2  ${UNDERLAY[VS2]} ${ID_HASH[VS4]} 192.168.42.34 ${UNDERLAY[VS4]}"
-USER_CTRL_ARGS[VS4]="geneve0 ${ID_HASH[VS4]} ${OVERLAY[VS4]} $NUM_REMOTE_PROXIES ${ID_HASH[VS1]} 192.168.42.1 ${UNDERLAY[VS3]} ${ID_HASH[VS2]} 192.168.42.2  ${UNDERLAY[VS3]} ${ID_HASH[VS3]} 192.168.42.43 ${UNDERLAY[VS3]}"
+USER_CTRL_ARGS[VS2]="geneve0 ${ID_HASH[VS2]} ${OVERLAY[VS2]} $NUM_REMOTE_PROXIES ${ID_HASH[VS1]} 192.168.42.21 ${UNDERLAY[VS1]} ${ID_HASH[VS3]} 192.168.42.23  ${UNDERLAY[VS3]} ${ID_HASH[VS4]} 192.168.42.24 ${UNDERLAY[VS3]}"
+USER_CTRL_ARGS[VS3]="geneve0 ${ID_HASH[VS3]} ${OVERLAY[VS3]} $NUM_REMOTE_PROXIES ${ID_HASH[VS1]} 192.168.42.31 ${UNDERLAY[VS2]} ${ID_HASH[VS2]} 192.168.42.32  ${UNDERLAY[VS2]} ${ID_HASH[VS4]} 192.168.42.34 ${UNDERLAY[VS4]}"
+USER_CTRL_ARGS[VS4]="geneve0 ${ID_HASH[VS4]} ${OVERLAY[VS4]} $NUM_REMOTE_PROXIES ${ID_HASH[VS1]} 192.168.42.41 ${UNDERLAY[VS3]} ${ID_HASH[VS2]} 192.168.42.42  ${UNDERLAY[VS3]} ${ID_HASH[VS3]} 192.168.42.43 ${UNDERLAY[VS3]}"
 
 
 
@@ -139,7 +139,7 @@ case $SITE in
         N=40
         ;;
 esac
-N=0
+
 [ $SITE == "VS1" ] || ip neigh add "192.168.42.$((N+1))" lladdr "${MAC[VS1]}" dev geneve0 nud permanent
 [ $SITE == "VS2" ] || ip neigh add "192.168.42.$((N+2))" lladdr "${MAC[VS2]}" dev geneve0 nud permanent
 [ $SITE == "VS3" ] || ip neigh add "192.168.42.$((N+3))" lladdr "${MAC[VS3]}" dev geneve0 nud permanent
@@ -174,8 +174,9 @@ fi
 
 echo ""
 echo "==> Setup complete"
-echo ""
+
 if [[ $SITE = "VS4" ]]; then
+    echo ""
     echo "Start the server-side proxy in a separate terminal:"
     echo ""
     printf '    '
@@ -187,6 +188,7 @@ if [[ $SITE = "VS4" ]]; then
     echo "    python3 -m http.server $BACKEND_PORT --directory $CERTS_DIR"
     echo ""
 elif [[ $SITE = "VS1" ]]; then
+    echo ""
     echo "Start the client-side proxy in a separate terminal:"
     echo ""
     printf '    '
@@ -198,8 +200,6 @@ elif [[ $SITE = "VS1" ]]; then
     echo ""
 fi
 
-echo ""
-echo ""
 info "Done.  Press Enter to tear down."
 read -r
 
