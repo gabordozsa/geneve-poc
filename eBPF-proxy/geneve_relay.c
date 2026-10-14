@@ -5,6 +5,7 @@
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/in.h>
+#include <linux/icmp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -12,7 +13,7 @@
 #define LOG_ERROR 2
 
 // Current log level
-#define LOG_LEVEL LOG_ERROR
+#define LOG_LEVEL LOG_INFO
 
 // virtual network ID
 #define VNI 42
@@ -228,6 +229,13 @@ static __always_inline int local_ingress_packet(struct __sk_buff *skb, __be32 sr
             }
         } else {
             log(LOG_ERROR,"(I) ingress: old UDP csum is zero, skip csum fixing");
+        }
+    } else if (ip->protocol == IPPROTO_ICMP) {
+        l4_csum_offset += offsetof(struct icmphdr, checksum);
+        ret = bpf_l4_csum_replace(skb, l4_csum_offset, 0, csum_diff, BPF_F_PSEUDO_HDR);
+        if (ret < 0) {
+            log(LOG_ERROR,"(E) ingress: bpf_l4_csum_replace() ICMP error: %d, dropping", ret);
+            return TC_ACT_SHOT;
         }
     }
 
@@ -447,12 +455,24 @@ static __always_inline int relay_egress_packet(struct __sk_buff *skb, __u8 dst_h
 SEC("tc/egress")
 int geneve_egress_rewrite(struct __sk_buff *skb)
 {
-    /*
-    struct route_entry default_route = {
-        .remote_ipv4 = 0x0A000103,
-        .local_ipv4 = 0x0A000102
-    };
-    */
+    /* DEBUG
+    void *data_end = (void *)(long)skb->data_end;
+    void *data     = (void *)(long)skb->data;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        log(LOG_ERROR,"(E) egress: eth header is missing");
+        return TC_ACT_SHOT;
+    }
+    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
+        log(LOG_INFO,"(I) egress: not an ipv4 packet, eth->h_proto: %02x , dropping", eth->h_proto);
+        return TC_ACT_SHOT;
+    }
+    bpf_printk("(I) egress: eth h_source %02x:%02x:%02x:%02x:%02x:%02x h_dest %02x:%02x:%02x:%02x:%02x:%02x",
+        eth->h_source[0], eth->h_source[1], eth->h_source[2],  eth->h_source[3], eth->h_source[4], eth->h_source[5],
+        eth->h_dest[0], eth->h_dest[1], eth->h_dest[2], eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
+
+    // DEBUG */
 
     __u8 dst_hash_index = (skb->mark >> 24);
     __u8 src_hash_index =  (skb->mark >> 16 & 0xFF);
