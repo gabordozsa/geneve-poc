@@ -13,7 +13,7 @@
 #define LOG_ERROR 2
 
 // Current log level
-#define LOG_LEVEL LOG_INFO
+#define LOG_LEVEL LOG_ERROR
 
 // virtual network ID
 #define VNI 42
@@ -146,7 +146,7 @@ static __always_inline int local_ingress_packet(struct __sk_buff *skb, __be32 sr
     }
 
     if (eth->h_proto != bpf_htons(ETH_P_IP)) {
-        log(LOG_ERROR,"(E) ingress: not an ipv4 packet, eth->h_proto: %x, dropping", eth->h_proto);
+        log(LOG_INFO,"(E) ingress: not an ipv4 packet, eth->h_proto: %x, dropping", eth->h_proto);
         return TC_ACT_SHOT;
     }
 
