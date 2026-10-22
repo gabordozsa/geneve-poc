@@ -5,13 +5,17 @@ CFLAGS  := -Wall -Wextra -Wpedantic -std=c11 \
 
 SRC_DIR    := src
 SRC     := $(SRC_DIR)/proxy.c
-TARGET  := proxy
+SRC_V2  := $(SRC_DIR)/proxy-v2.c
+TARGET  := proxy proxy-v2
 
-.PHONY: all proxy clean
+.PHONY: all proxy proxy-v2 clean
 
 all: $(TARGET)
 
 proxy: $(SRC)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $< -lssl -lcrypto
+
+proxy-v2: $(SRC_V2)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $< -lssl -lcrypto
 
 clean:
