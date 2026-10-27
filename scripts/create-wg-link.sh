@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+set -eu
+
+SUDO=sudo
+#SUDO=echo
 
 usage () {
     echo "$1, usage: $0 [-c] -l <local_overlay_ip>  -k <peer_public_key> -p <peer_overlay_ip> [-u <peer_underlay_ip>]"
@@ -6,6 +10,10 @@ usage () {
 }
 
 (($# > 3)) || usage "argc $#" 
+
+CREATE_KEYS=""
+PEER_UNDERLAY_IP=""
+PEER_ENDPOINT=""
 
 while getopts ":cl:k:p:u" opt; do
     case $opt in
@@ -21,9 +29,6 @@ done
 [[ -n $PEER_UNDERLAY_IP ]] && PEER_UNDERLAY_IP=${@:$OPTIND:1}
 
 echo "CREATE_KEYS:$CREATE_KEYS LOCAL_OVERLAY_IP:$LOCAL_OVERLAY_IP PEER_PUBKEY:$PEER_PUBKEY PEER_OVERLAY_IP:$PEER_OVERLAY_IP PEER_UNDERLAY_IP:$PEER_UNDERLAY_IP" 
-
-SUDO=sudo
-#SUDO=echo
 
 # Generate keys if they don't exist yet. Apparmor on Ubuntu requires to use /etc/wireguard dir
 KEY_DIR=/etc/wireguard
