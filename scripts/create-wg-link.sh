@@ -44,7 +44,7 @@ $SUDO ip address add dev wg0 $LOCAL_OVERLAY_IP/24
 $SUDO wg set wg0 private-key $KEY_DIR/privatekey listen-port 51820
 
 [[ -n $PEER_UNDERLAY_IP ]] && PEER_ENDPOINT="endpoint $PEER_UNDERLAY_IP:51820"
-$SUDO wg set wg0 peer $PEER_PUBKEY allowed-ips $PEER_OVERLAY_IP/32 $PEER_ENDPOINT
+$SUDO wg set wg0 peer "$PEER_PUBKEY" allowed-ips $PEER_OVERLAY_IP/32 $PEER_ENDPOINT
 
 $SUDO ip link set up dev wg0
 
