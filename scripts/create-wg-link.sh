@@ -9,7 +9,6 @@ usage () {
     exit 1
 }
 
-(($# > 3)) || usage "argc $#" 
 
 CREATE_KEYS=""
 PEER_UNDERLAY_IP=""
@@ -26,23 +25,31 @@ while getopts ":cl:k:p:u" opt; do
     esac
 done
 
+
+echo "CREATE_KEYS: $CREATE_KEYS"
+
+# Generate keys if they don't exist yet. Apparmor on Ubuntu requires to use /etc/wireguard dir
+KEY_DIR=/etc/wireguard
+if [[ -n $CREATE_KEYS ]] && ! $SUDO test -f $KEY_DIR/privatekey; then
+    ! SUDO test -f $KEY_DIR && $SUDO apt install wireguard-tools
+    $SUDO touch $KEY_DIR/privatekey
+    $SUDO chmod 0600 $KEY_DIR/privatekey
+    wg genkey | $SUDO tee $KEY_DIR/privatekey
+    $SUDO cat $KEY_DIR/privatekey | wg pubkey | sudo tee $KEY_DIR/publickey
+    echo "Keys created, publickey: $($SUDO cat $KEYDIR/publickey)"
+    exit 0
+fi
+
+(($# > 3)) || usage "argc $#" 
+
 [[ -n $PEER_UNDERLAY_IP ]] && PEER_UNDERLAY_IP=${@:$OPTIND:1}
 
 echo "CREATE_KEYS:$CREATE_KEYS LOCAL_OVERLAY_IP:$LOCAL_OVERLAY_IP PEER_PUBKEY:$PEER_PUBKEY PEER_OVERLAY_IP:$PEER_OVERLAY_IP PEER_UNDERLAY_IP:$PEER_UNDERLAY_IP" 
 
-# Generate keys if they don't exist yet. Apparmor on Ubuntu requires to use /etc/wireguard dir
-KEY_DIR=/etc/wireguard
-if [[ -n $CREATE_KEYS ]] && ! sudo test -f $KEY_DIR/privatekey; then
-    $SUDO touch $KEY_DIR/privatekey
-    $SUDO chmod 0600 $KEY_DIR/privatekey
-    wg genkey | sudo tee $KEY_DIR/privatekey
-    $SUDO cat $KEY_DIR/privatekey | wg pubkey | sudo tee $KEY_DIR/publickey
-fi
-
 [[ -n $PEER_PUBKEY ]] || { "Peer public key must be set - exiting"; exit 1; }
 
 # Delete iface if it exists
-$SUDO ip link del dev wg0 2>/dev/null
+$SUDO ip link del dev wg0 2>/dev/null || true
 
 $SUDO ip link add dev wg0 type wireguard
 $SUDO ip address add dev wg0 $LOCAL_OVERLAY_IP/24
