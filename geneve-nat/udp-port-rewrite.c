@@ -101,6 +101,10 @@ int udp_port_rewrite(struct __sk_buff *skb)
         return TC_ACT_OK; // nothing saved, leave the packet unchanged
     }
 
+    __be16 new_sport = bpf_htons(GENEVE_PORT);
+    udp->source = new_sport;
+    bpf_printk("egress: src port already changed to %u", GENEVE_PORT);
+
     __be16 old_port = udp->dest;
     __be16 new_port = *saved;
     if (new_port == old_port) {
@@ -122,11 +126,14 @@ int udp_port_rewrite(struct __sk_buff *skb)
         bpf_printk("egress: failed to rewrite dst port");
         return TC_ACT_OK;
     }
+
+    /*
     __be16 new_sport = bpf_htons(GENEVE_PORT);
     if (bpf_skb_store_bytes(skb, sport_off, &new_sport, sizeof(new_sport), 0) < 0) {
         bpf_printk("egress: failed to rewrite src port");
         return TC_ACT_OK;
     }
+    */
 
     bpf_printk("egress: rewrote dst port %u -> %u", bpf_ntohs(old_port), bpf_ntohs(new_port));
     return TC_ACT_OK;
