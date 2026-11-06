@@ -94,16 +94,16 @@ int udp_port_rewrite(struct __sk_buff *skb)
     if (!udp)
         return TC_ACT_OK;
 
+ __be16 new_sport = bpf_htons(GENEVE_PORT);
+    udp->source = new_sport;
+    bpf_printk("egress: src port already changed to %u", GENEVE_PORT);
+
     __u32 key = GENEVE_PORT;
     __be16 *saved = bpf_map_lookup_elem(&port_map, &key);
     if (!saved) {
         bpf_printk("egress: no saved port, packet unchanged");
         return TC_ACT_OK; // nothing saved, leave the packet unchanged
     }
-
-    __be16 new_sport = bpf_htons(GENEVE_PORT);
-    udp->source = new_sport;
-    bpf_printk("egress: src port already changed to %u", GENEVE_PORT);
 
     __be16 old_port = udp->dest;
     __be16 new_port = *saved;
