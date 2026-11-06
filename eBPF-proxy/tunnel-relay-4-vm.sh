@@ -12,15 +12,16 @@
 set -euo pipefail
 
 # Geneve overhead:
-# outer eth header.    14 bytes
 # outer ipv4 header    20 bytes
 # outer udp header.     8 bytes
 # Geneve base header    8 bytes
 # My custom TLV option 12 bytes
+# Inner eth header     14
 # total 62 bytes
 # physycal iface (ens3) mtu is 1500
 MTU=1438
-
+# WireGuard MTU=1420
+#MTU=1358
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -95,10 +96,17 @@ ID_HASH[VS3]=300
 ID_HASH[VS4]=400
 
 declare -A UNDERLAY
+
 UNDERLAY[VS1]="10.251.64.6"
 UNDERLAY[VS2]="10.251.0.5"
 UNDERLAY[VS3]="10.251.64.4"
 UNDERLAY[VS4]="10.251.0.4"
+
+# route through wireguard
+#UNDERLAY[VS1]="192.168.100.1"
+#UNDERLAY[VS2]="192.168.100.2"
+#UNDERLAY[VS3]="192.168.100.3"
+#UNDERLAY[VS4]="192.168.100.4"
 
 declare -A OVERLAY
 OVERLAY[VS1]="192.168.42.100"
@@ -128,6 +136,7 @@ USER_CTRL_ARGS[VS4]="geneve0 ${ID_HASH[VS4]} ${OVERLAY[VS4]} $NUM_REMOTE_PROXIES
 info "Creating geneve0 at site $SITE"
 
 # ns-left: external Geneve
+# ip link add geneve0 type geneve dstport "${GENEVE_PORT}" external innerprotoinherit
 ip link add geneve0 type geneve dstport "${GENEVE_PORT}" external
 ip link set geneve0 address "${MAC[$SITE]}"
 ip addr add "${OVERLAY[$SITE]}/24" dev geneve0

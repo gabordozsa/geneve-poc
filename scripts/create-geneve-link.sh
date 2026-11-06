@@ -146,11 +146,13 @@ info "Creating Geneve interface '$IFACE'  (remote=$REMOTE  vni=$VNI  port=$PORT)
 ip link add "$IFACE" type geneve \
     remote  "$REMOTE"   \
     vni     "$VNI"      \
-    dstport "$PORT"
+    dstport "$PORT"     \
+    udpcsum             \
+    innerprotoinherit
 
 # Override the kernel-assigned MAC with our deterministic one before bringing
 # the interface up, so no traffic is ever sent with the random MAC.
-ip link set "$IFACE" address "$MAC"
+#ip link set "$IFACE" address "$MAC"
 
 # ---------- assign IPv4 address and bring the interface up --------------------
 info "Assigning address $ADDR to $IFACE"
