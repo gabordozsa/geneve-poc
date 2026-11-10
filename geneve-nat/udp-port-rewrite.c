@@ -17,7 +17,7 @@
 
 /*
  * Saved UDP source port
- * Key   = 6081 (the UDP destination port the ingress filter matched on), host byte order
+ * Key   = source IP, host byte order
  * Value = UDP source port seen in the last ingress packet with dest port 6081,
  *         network byte order
  *
@@ -27,7 +27,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, __be16);
+    __type(value, __be32);
 } port_map SEC(".maps");
 
 /*
@@ -35,7 +35,7 @@ struct {
  * if the packet is a non-fragmented IPv4 UDP packet with destination port
  * GENEVE_PORT, NULL otherwise.
  */
-static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb)
+static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __be32 *saddr, __be32 *daddr)
 {
     void *data_end = (void *)(long)skb->data_end;
     void *data     = (void *)(long)skb->data;
@@ -58,6 +58,9 @@ static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb)
     if (ihl < sizeof(*ip))
         return NULL;
 
+    *saddr = ip->saddr;
+    *daddr = ip->daddr;
+
     struct udphdr *udp = (void *)ip + ihl;
     if ((void *)(udp + 1) > data_end)
         return NULL;
@@ -71,18 +74,19 @@ static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb)
 SEC("tc/ingress")
 int udp_port_save(struct __sk_buff *skb)
 {
-    struct udphdr *udp = geneve_udp_hdr(skb);
+    __be32 saddr;
+    __be32 daddr;
+    struct udphdr *udp = geneve_udp_hdr(skb, &saddr, &daddr);
     if (!udp)
         return TC_ACT_OK;
 
-    __u32 key = GENEVE_PORT;
     __be16 sport = udp->source;
 
-    long ret = bpf_map_update_elem(&port_map, &key, &sport, BPF_ANY);
+    long ret = bpf_map_update_elem(&port_map, &saddr, &sport, BPF_ANY);
     if (ret < 0)
-        bpf_printk("ingress: failed to save src port %u, error %ld", bpf_ntohs(sport), ret);
+        bpf_printk("ingress: failed to save src %04x port %u, error %ld", bpf_ntohl(saddr), bpf_ntohs(sport), ret);
     else
-        bpf_printk("ingress: saved src port %u for dst port %u", bpf_ntohs(sport), key);
+        bpf_printk("ingress: saved src port %u for saddr %04x", bpf_ntohs(sport), bpf_ntohl(saddr));
     return TC_ACT_OK;
 }
 
@@ -90,50 +94,54 @@ int udp_port_save(struct __sk_buff *skb)
 SEC("tc/egress")
 int udp_port_rewrite(struct __sk_buff *skb)
 {
-    struct udphdr *udp = geneve_udp_hdr(skb);
+    __be32 saddr, daddr;
+    struct udphdr *udp = geneve_udp_hdr(skb, &saddr, &daddr);
     if (!udp)
         return TC_ACT_OK;
 
- __be16 new_sport = bpf_htons(GENEVE_PORT);
-    udp->source = new_sport;
-    bpf_printk("egress: src port already changed to %u", GENEVE_PORT);
-
-    __u32 key = GENEVE_PORT;
-    __be16 *saved = bpf_map_lookup_elem(&port_map, &key);
-    if (!saved) {
-        bpf_printk("egress: no saved port, packet unchanged");
+    // Only change UDP packets targeting known (Geneve) peers
+    // If the peer is public then user_control adds it to the ebpf map with port 6081
+    // If the peer is private then the ingress must add its address and port to the map first
+    __be16 *saved_port = bpf_map_lookup_elem(&port_map, &daddr);
+    if (!saved_port) {
+        bpf_printk("egress: no saved peer port, packet unchanged");
         return TC_ACT_OK; // nothing saved, leave the packet unchanged
     }
 
-    __be16 old_port = udp->dest;
-    __be16 new_port = *saved;
+    __u32 udp_off   = (void *)udp - (void *)(long)skb->data;
+    __u32 csum_off  = udp_off + offsetof(struct udphdr, check);
+
+    // Always change the souce port when sending to known Geneve peers
+    __be16 old_port = udp->source;
+    __be16 new_port = bpf_htons(GENEVE_PORT);
+    udp->source = new_port;
+    if (udp->check) {
+        if (bpf_l4_csum_replace(skb, csum_off, old_port, new_port,
+                            BPF_F_MARK_MANGLED_0 | sizeof(new_port)) < 0) {
+            bpf_printk("egress: checksum failed for source port change");
+            return TC_ACT_SHOT;
+        }
+    }
+    bpf_printk("egress: src port changed to %u", GENEVE_PORT);
+
+    // Change the dest port back to the original if there is NAT/conntrack, i.e. if
+    // the ingress packet had a source port differebt than 6081.
+    old_port = udp->dest;
+    new_port = *saved_port;
     if (new_port == old_port) {
         bpf_printk("egress: dst port already %u, packet unchanged", bpf_ntohs(old_port));
         return TC_ACT_OK;
     }
 
-    /* Offsets must be computed before calling helpers that invalidate packet pointers */
-    __u32 udp_off   = (void *)udp - (void *)(long)skb->data;
-    __u32 dport_off = udp_off + offsetof(struct udphdr, dest);
-    __u32 sport_off = udp_off + offsetof(struct udphdr, source);
-    __u32 csum_off  = udp_off + offsetof(struct udphdr, check);
+    udp->dest = new_port;
 
-    /* Update the UDP checksum first (no BPF_F_PSEUDO_HDR: ports are not in the pseudo header;
-     * the kernel leaves a CHECKSUM_PARTIAL offloaded checksum alone), then the port. */
-    if (bpf_l4_csum_replace(skb, csum_off, old_port, new_port,
-                            BPF_F_MARK_MANGLED_0 | sizeof(new_port)) < 0 ||
-        bpf_skb_store_bytes(skb, dport_off, &new_port, sizeof(new_port), 0) < 0) {
-        bpf_printk("egress: failed to rewrite dst port");
-        return TC_ACT_OK;
+    if (udp->check) {
+        if (bpf_l4_csum_replace(skb, csum_off, old_port, new_port,
+                            BPF_F_MARK_MANGLED_0 | sizeof(new_port)) < 0) {
+            bpf_printk("egress: checksum failed for dst port change");
+            return TC_ACT_SHOT;
+        }
     }
-
-    /*
-    __be16 new_sport = bpf_htons(GENEVE_PORT);
-    if (bpf_skb_store_bytes(skb, sport_off, &new_sport, sizeof(new_sport), 0) < 0) {
-        bpf_printk("egress: failed to rewrite src port");
-        return TC_ACT_OK;
-    }
-    */
 
     bpf_printk("egress: rewrote dst port %u -> %u", bpf_ntohs(old_port), bpf_ntohs(new_port));
     return TC_ACT_OK;
