@@ -12,7 +12,7 @@
 #define LOG_ERROR 2
 
 // Current log level
-#define LOG_LEVEL LOG_ERROR
+#define LOG_LEVEL LOG_INFO
 
 // virtual network ID (must be less than 256 to fit into a dingle byte)
 #define VNI 42
@@ -205,7 +205,8 @@ static __always_inline int local_ingress_packet(struct __sk_buff *skb, __be32 sr
         return TC_ACT_SHOT;
     }
 
-    __u32 l3_csum_offset = sizeof(struct ethhdr) + offsetof(struct iphdr, check);
+    // geneve0 is an L3 device (innerprotoinherit): no Ethernet header, packet starts at the IP header
+    __u32 l3_csum_offset = offsetof(struct iphdr, check);
 
     int ret = bpf_l3_csum_replace(skb, l3_csum_offset, 0, csum_diff, 0);
     if (ret < 0) {
@@ -226,7 +227,7 @@ static __always_inline int local_ingress_packet(struct __sk_buff *skb, __be32 sr
 
     // TODO : check if the csum replace is really necessary here ...
 
-    __u32 l4_csum_offset = sizeof(struct ethhdr) + sizeof(struct iphdr);
+    __u32 l4_csum_offset = sizeof(struct iphdr);
 
     if (ip->protocol == IPPROTO_TCP) {
         l4_csum_offset += offsetof(struct tcphdr, check);
@@ -575,8 +576,9 @@ static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __be
         return NULL;
     }
 
-    *src_id_hash = opt->opt_data[0];
-    *dst_id_hash = opt->opt_data[1];
+    // Option layout is [dest ID hash][src ID hash]
+    *dst_id_hash = opt->opt_data[0];
+    *src_id_hash = opt->opt_data[1];
 
     return udp;
 }
