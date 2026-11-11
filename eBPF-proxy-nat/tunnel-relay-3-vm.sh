@@ -42,10 +42,11 @@ trap cleanup EXIT
 SITE=$1
 
 POC_DIR=/home/ubuntu/geneve-poc
+[[ $SITE == VS3 ]] ||POC_DIR=/home/gabor/genve-poc
 
 # control plane to attach and configure ingress/egress ebpf tc filters
 USER_CONTROL=$POC_DIR/eBPF-proxy/user_control
-
+ 
 
 # Launch proxies in ns-left ans ns-right
 PROXY="$POC_DIR/proxy"
