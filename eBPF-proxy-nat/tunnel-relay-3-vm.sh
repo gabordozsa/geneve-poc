@@ -45,7 +45,7 @@ POC_DIR=/home/ubuntu/geneve-poc
 [[ $SITE == VS3 ]] ||POC_DIR=/home/gabor/geneve-poc
 
 # control plane to attach and configure ingress/egress ebpf tc filters
-USER_CONTROL=$POC_DIR/eBPF-proxy/user_control
+USER_CONTROL=$POC_DIR/eBPF-proxy-nat/user_control
  
 
 # Launch proxies in ns-left ans ns-right
