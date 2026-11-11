@@ -528,7 +528,13 @@ static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __be
     void *data_end = (void *)(long)skb->data_end;
     void *data     = (void *)(long)skb->data;
 
-    struct iphdr *ip = data;
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return NULL;
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return NULL;
+
+    struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
         return NULL;
     if (ip->protocol != IPPROTO_UDP)
@@ -652,7 +658,15 @@ int udp_port_rewrite(struct __sk_buff *skb)
     void *data_end = (void *)(long)skb->data_end;
     void *data     = (void *)(long)skb->data;
 
-    struct iphdr *ip = data;
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+         log(LOG_ERROR, "udp egress: FATAL eth header");
+        return TC_ACT_SHOT;;
+    }
+    //if (eth->h_proto != bpf_htons(ETH_P_IP))
+    //    return NULL;
+
+    struct iphdr *ip = (void *)(eth + 1);
      if ((void *)(ip + 1) > data_end) {
         log(LOG_ERROR, "udp egress: FATAL ip header 1");
         return TC_ACT_SHOT;
