@@ -564,7 +564,7 @@ static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __be
     if ((void *)(inner_ip + 1) > data_end)
         return NULL;
 
-    if (gen->vni[0] != VNI || gen->vni[1] !=0 || gen->vni[2] != 0) {
+    if (gen->vni[2] != VNI || gen->vni[1] !=0 || gen->vni[0] != 0) {
         bpf_printk("(W) udp geneve_udp_hdr(): vni missmatch vni[0]: %u vni[1]: %u vni[2]: %u", gen->vni[0], gen->vni[1], gen->vni[2]);
         return NULL;
     }

@@ -215,6 +215,11 @@ static int tc_attach_bpf(unsigned int ifindex, int attach_point,
     }
     *hook_out = hook;
     *opts_out = opts;
+    // bpf_tc_detach() rejects (-EINVAL) opts with prog_fd, prog_id or flags set. Only handle
+    // and priority (filled in by bpf_tc_attach()) may be non-zero.
+    opts_out->prog_fd = 0;
+    opts_out->prog_id = 0;
+    opts_out->flags   = 0;
     return 0;
 }
 
@@ -427,6 +432,7 @@ int main(int argc, char **argv)
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL); // tunnel-relay-3-vm.sh stops us with "kill" (SIGTERM)
 
     /* ── 5. Attach ingress eBPF ──────────────────────────────────────────── */
     g_obj = obj;
