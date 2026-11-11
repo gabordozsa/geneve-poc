@@ -162,7 +162,6 @@ static int new_id_hash_to_maps(uint32_t hash, const char *ip_str, const char *nh
     // hash2nh
     union ip4 nh;
     if (strcmp(nh_str, "0.0.0.0")) {
-        union ip4 nh;
         if (ip4_ptole(nh_str, &nh) < 0) {
             fprintf(stderr, "[-] Invalid nh IP: %s for hash %d\n", nh_str, hash);
             return -1;
