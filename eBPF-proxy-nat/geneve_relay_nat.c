@@ -527,13 +527,7 @@ static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __be
     void *data_end = (void *)(long)skb->data_end;
     void *data     = (void *)(long)skb->data;
 
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
-        return NULL;
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return NULL;
-
-    struct iphdr *ip = (void *)(eth + 1);
+    struct iphdr *ip = data;
     if ((void *)(ip + 1) > data_end)
         return NULL;
     if (ip->protocol != IPPROTO_UDP)
@@ -651,6 +645,27 @@ int udp_port_rewrite(struct __sk_buff *skb)
         }
     }
     bpf_printk("egress: src port changed to %u", GENEVE_PORT);
+
+    // Need to re-validate udp pointer after calling bpf_l4_csum_replace()
+    void *data_end = (void *)(long)skb->data_end;
+    void *data     = (void *)(long)skb->data;
+
+    struct iphdr *ip = data;
+     if ((void *)(ip + 1) > data_end) {
+        log(LOG_ERROR, "udp egress: FATAL ip header 1");
+        return TC_ACT_SHOT;
+     }
+    __u32 ihl = ip->ihl * 4;
+    if (ihl < sizeof(*ip)) {
+        log(LOG_ERROR, "udp egress: FATAL ip header 2");
+        return TC_ACT_SHOT;
+    }
+
+    udp = (void *)ip + ihl;
+    if ((void *)(udp + 1) > data_end) {
+        log(LOG_ERROR, "udp egress: FATAL udp header");
+        return TC_ACT_SHOT;
+    }
 
     // Change the dest port back to the original if there is NAT/conntrack, i.e. if
     // the ingress packet had a source port different from 6081.
