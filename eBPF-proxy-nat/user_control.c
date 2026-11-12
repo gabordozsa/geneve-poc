@@ -166,7 +166,7 @@ static int new_id_hash_to_maps(uint32_t hash, const char *ip_str, const char *nh
             fprintf(stderr, "[-] Invalid nh IP: %s for hash %d\n", nh_str, hash);
             return -1;
         }
-        nh_port nhp = { nh.num, GENEVE_PORT };
+        nh_port nhp = { nh.num, htons(GENEVE_PORT) };
         if (bpf_map_update_elem(hash2nh_fd, &hash, &nhp, BPF_ANY) != 0) {
             perror("[-] hash2nh bpf_map_update_elem");
             return -1;
