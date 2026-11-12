@@ -18,6 +18,9 @@
 #define VNI 42
 
 // Geneve TLV option calss and type
+// TODO: change class to the range 0x0111-0x0118.
+// This range belongs to IBM (see https://www.iana.org/assignments/nvo3)
+// Also check if tunnel_set_opt() needs this is network or in host order ....
 #define OPT_CLASS 0x0101
 #define OPT_TYPE    0x2A
 
@@ -73,7 +76,7 @@ struct geneve_opt_custom {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_PROXIES);
-    __type(key, __be32);
+    __type(key, __u32);  // hash IDs are host order always (even in the Geneve header)
     __type(value, __be32);
 } ip2hash SEC(".maps");
 
@@ -89,7 +92,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_PROXIES);
-    __type(key, __be32);
+    __type(key, __u32); // hash IDs are host order always (even in the Geneve header)
     __type(value, __be32);
 } hash2ip SEC(".maps");
 
@@ -104,14 +107,14 @@ struct {
  * Used at egress for each packet.
  */
  typedef struct nh_port {
-    __be32 nh;
+    __u32 nh;     // host order -> set_tunnel_key() converts in network order
     __be16 port;
  } nh_port;
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_PROXIES);
-    __type(key, __be32);
+    __type(key, __u32);
     __type(value, nh_port);
 } hash2nh SEC(".maps");
 
@@ -127,7 +130,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_PROXIES);
-    __type(key, __be32);
+    __type(key, __u32); // hash IDs are host order always (even in the Geneve header)
     __type(value, __u8);
 } hash2ind SEC(".maps");
 
@@ -143,7 +146,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_PROXIES);
     __type(key, __u8);
-    __type(value, __be32);
+    __type(value, __u32); // hash IDs are host order always (even in the Geneve header)
 } ind2hash SEC(".maps");
 
 /* Global variables set from user-space at load-time */
@@ -154,11 +157,11 @@ const volatile __be32 LOCAL_OVERLAY_IP;
 #define log(level, fmt, args...) if (level >= LOG_LEVEL) bpf_printk("[%08x] " fmt, LOCAL_ID_HASH, ##args)
 
 /* Ingress: packet reached its final destination */
-static __always_inline int local_ingress_packet(struct __sk_buff *skb, __be32 src_id_hash) {
+static __always_inline int local_ingress_packet(struct __sk_buff *skb, __u32 src_id_hash) {
     // Get the locally assigned overlay ip for the src_id_hash
     __be32 *src_ip_ptr = bpf_map_lookup_elem(&hash2ip, &src_id_hash);
     if (!src_ip_ptr) {
-        log(LOG_ERROR,"ingress: no local ip for src proxy ID hash %08x, dropping", bpf_ntohl(src_id_hash));
+        log(LOG_ERROR,"ingress: no local ip for src proxy ID hash %u, dropping", src_id_hash);
         return TC_ACT_SHOT;
     }
     __be32 new_src_ip = *src_ip_ptr;
@@ -266,22 +269,22 @@ static __always_inline int local_ingress_packet(struct __sk_buff *skb, __be32 sr
 }
 
 /* Ingress: relay packet */
-static __always_inline int relay_ingress_packet(struct __sk_buff *skb, __be32 dst_id_hash, __be32 src_id_hash) {
+static __always_inline int relay_ingress_packet(struct __sk_buff *skb, __u32 dst_id_hash, __u32 src_id_hash) {
     __u8 *hash_index_ptr = bpf_map_lookup_elem(&hash2ind, &dst_id_hash);
     if(!hash_index_ptr) {
-        log(LOG_ERROR,"(E) ingress: no index for dst ID hash %08x, dropping", dst_id_hash);
+        log(LOG_ERROR,"(E) ingress: no index for dst ID hash %u, dropping", dst_id_hash);
         return TC_ACT_SHOT;
     }
     __u8 dst_hash_index = *hash_index_ptr;
     hash_index_ptr = bpf_map_lookup_elem(&hash2ind, &src_id_hash);
     if(!hash_index_ptr) {
-        log(LOG_ERROR,"(E) ingress: no index for src ID hash %08x, dropping", src_id_hash);
+        log(LOG_ERROR,"(E) ingress: no index for src ID hash %u, dropping", src_id_hash);
         return TC_ACT_SHOT;
     }
     __u8 src_hash_index = *hash_index_ptr;
 
     // Pass hash indices to egress filter using the upper 16 bits of skb->mark
-    // FIXME: this may cause problems if mark is already in use. More robust solution would be:
+    // FIXME: this may cause problems if mark is already in use. More robust solution would be to
     // pass the info via another ebpf map where the key is an incremented counter modulo map size.
     // (I.e. use map as producer/consumer queue ...)
     if (skb->mark >> 16) {
@@ -325,14 +328,32 @@ int geneve_ingress_redirect(struct __sk_buff *skb)
 
     if (bpf_ntohs(opt.opt_class) != OPT_CLASS || opt.type != OPT_TYPE) {
         log(LOG_ERROR,"ingress: Unknown opt class or type. Expected %04x/%02x got %04x/%02x, dropping", 
-        bpf_htons(OPT_CLASS), OPT_TYPE, bpf_ntohs(opt.opt_class), opt.type);
+            OPT_CLASS, OPT_TYPE, bpf_ntohs(opt.opt_class), opt.type);
         return TC_ACT_SHOT;
     }
-    __be32 dst_id_hash = opt.opt_data[0];
-    __be32 src_id_hash = opt.opt_data[1];
+    __u32 dst_id_hash = opt.opt_data[0];
+    __u32 src_id_hash = opt.opt_data[1];
 
-    log(LOG_INFO,"ingress: dest proxy ID hash %08x source proxy ID hash %08x", 
-        bpf_ntohl(dst_id_hash), bpf_ntohl(src_id_hash));
+    log(LOG_INFO,"ingress: dest proxy ID hash %u source proxy ID hash %u", dst_id_hash, src_id_hash);
+
+    // Check outer src address and upate hash2nh if it is outdated
+    struct bpf_tunnel_key tkey = {};
+    int ret = bpf_skb_get_tunnel_key(skb, &tkey, sizeof(tkey), 0);
+    if (ret < 0) {
+        log(LOG_ERROR,"ingress: get tunnel key error: %d, dropping ...", ret);
+        return TC_ACT_SHOT;
+    }
+    nh_port *nhp_ptr = bpf_map_lookup_elem(&hash2nh, &src_id_hash);
+    if (!nhp_ptr) {
+        log(LOG_ERROR, "ingress: no entry for hash id %d  in hash2nh map (udp-ingress error?), dropping ...",
+            src_id_hash);
+        return TC_ACT_SHOT;
+    }
+    if (nhp_ptr->nh != tkey.remote_ipv4) {
+        log(LOG_INFO, "ingress: updating hash2nh for hash_id %u with nh: %08x (port: %u)",
+            src_id_hash, tkey.remote_ipv4, nhp_ptr->port);
+        nhp_ptr->nh = tkey.remote_ipv4; // in-place update
+    }
 
     if (dst_id_hash == LOCAL_ID_HASH) {
         log(LOG_INFO, "ingress: local ingress packet");
@@ -360,7 +381,7 @@ static __always_inline int set_tunnel_key_and_opt(struct __sk_buff *skb, __be32 
     }
 
     struct geneve_opt_custom gen_opt = {};
-    gen_opt.opt_class = bpf_htons((OPT_CLASS));
+    gen_opt.opt_class = bpf_htons(OPT_CLASS);
     gen_opt.type = OPT_TYPE;
     gen_opt.opt_data[0] = dest_id_hash;
     gen_opt.opt_data[1] = src_id_hash;
@@ -395,17 +416,17 @@ static __always_inline int local_egress_packet(struct __sk_buff *skb) {
         return TC_ACT_SHOT;
     }
     __be32 dest_id_hash = *id_hash_ptr;
-    log(LOG_INFO,"(I) local_egress_packet(): dest id_hash: %08x", bpf_ntohl(dest_id_hash));
+    log(LOG_INFO,"(I) local_egress_packet(): dest id_hash: %u", dest_id_hash);
 
     // Get the underlay IP of the next hop
     nh_port *nh_port_ptr = bpf_map_lookup_elem(&hash2nh, &dest_id_hash);
     if (!nh_port_ptr) {
-        log(LOG_ERROR,"(W) local_egress_packet(): no next hop IP (yet ?) for dest ID hash: %08x, dropping ...", 
-            bpf_ntohl(dest_id_hash));
+        log(LOG_ERROR,"(W) local_egress_packet(): no next hop IP (yet ?) for dest ID hash: %u, dropping ...", 
+            dest_id_hash);
         return TC_ACT_SHOT;
     }
     __be32 nh_ip = nh_port_ptr->nh;
-    __be32 src_id_hash = LOCAL_ID_HASH;
+    __u32 src_id_hash = LOCAL_ID_HASH;
 
     return set_tunnel_key_and_opt(skb, nh_ip, dest_id_hash, src_id_hash);
 }
@@ -413,12 +434,12 @@ static __always_inline int local_egress_packet(struct __sk_buff *skb) {
 // Relay egress packet
 static __always_inline int relay_egress_packet(struct __sk_buff *skb, __u8 dst_hash_index, __u8 src_hash_index) {
     // Get the ID hash of the dest proxy
-    __be32 *id_hash_ptr = bpf_map_lookup_elem(&ind2hash, &dst_hash_index);
+    __u32 *id_hash_ptr = bpf_map_lookup_elem(&ind2hash, &dst_hash_index);
     if (!id_hash_ptr) {
         log(LOG_ERROR,"(E) relay_egress_packet(): no dest ID hash for index: %d, dropping", dst_hash_index);
         return TC_ACT_SHOT;
     }
-    __be32 dest_id_hash = *id_hash_ptr;
+    __u32 dest_id_hash = *id_hash_ptr;
 
     // Get the ID hash of the src proxy
     id_hash_ptr = bpf_map_lookup_elem(&ind2hash, &src_hash_index);
@@ -426,18 +447,18 @@ static __always_inline int relay_egress_packet(struct __sk_buff *skb, __u8 dst_h
         log(LOG_ERROR,"(E) relay_egress_packet(): no src ID hash for index: %d, dropping", src_hash_index);
         return TC_ACT_SHOT;
     }
-     __be32 src_id_hash = *id_hash_ptr;
+     __u32 src_id_hash = *id_hash_ptr;
 
     // Get the underlay IP of the next hop
     nh_port *nh_port_ptr = bpf_map_lookup_elem(&hash2nh, &dest_id_hash);
     if (!nh_port_ptr) {
-        log(LOG_ERROR,"(W) relay_egress_packet(): no next hop IP (yet ?) for dest ID hash: %08x", bpf_ntohl(dest_id_hash));
+        log(LOG_ERROR,"(W) relay_egress_packet(): no next hop IP (yet ?) for dest ID hash: %u", dest_id_hash);
         return TC_ACT_SHOT;
     }
-    __be32 nh_ip = nh_port_ptr->nh;
+    __u32 nh_ip = nh_port_ptr->nh; // nh is in host byte order
 
-    log(LOG_INFO,"(I) relay_egress_packet(): dest id_hash: %08x src id_hash: %08x nh_ip: %08x", 
-        bpf_ntohl(dest_id_hash), bpf_ntohl(src_id_hash),  bpf_ntohl(nh_ip));
+    log(LOG_INFO,"(I) relay_egress_packet(): dest id_hash: %u src id_hash: %u nh_ip: %08x", 
+        dest_id_hash, src_id_hash, nh_ip);
     return set_tunnel_key_and_opt(skb, nh_ip, dest_id_hash, src_id_hash);
 }
 
@@ -523,7 +544,7 @@ struct {
  * if the packet is a non-fragmented IPv4 UDP packet with destination port
  * GENEVE_PORT, NULL otherwise.
  */
-static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __be32 *saddr, __be32 *daddr, __be32 *src_id_hash, __be32 *dst_id_hash)
+static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __u32 *src_id_hash, __u32 *dst_id_hash)
 {
     void *data_end = (void *)(long)skb->data_end;
     void *data     = (void *)(long)skb->data;
@@ -546,16 +567,13 @@ static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __be
     if (ihl < sizeof(*ip))
         return NULL;
 
-    *saddr = ip->saddr;
-    *daddr = ip->daddr;
-
     struct udphdr *udp = (void *)ip + ihl;
     if ((void *)(udp + 1) > data_end)
         return NULL;
     if (udp->dest != bpf_htons(GENEVE_PORT))
         return NULL;
 
-    // Check if the packet has the expected Geneve option
+    // Check if the packet has the expected Geneve optio, i.e. it is one of our Geneve packet
     // TODO : make this simpler: only check if inner source IP == LOCAL_OVERLAY_IP (which is common for all sites)
     // That would make it sure that it is a Geneve packet from one of our Geneve iface ....
     struct genevehdr *gen = (void *)(udp + 1);
@@ -593,26 +611,31 @@ static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __be
 SEC("tc/ingress")
 int udp_port_save(struct __sk_buff *skb)
 {
-    __be32 saddr, daddr, src_id_hash, dst_id_hash;
-    struct udphdr *udp = geneve_udp_hdr(skb, &saddr, &daddr, &src_id_hash, &dst_id_hash);
+    __u32 src_id_hash, dst_id_hash;
+    struct udphdr *udp = geneve_udp_hdr(skb, &src_id_hash, &dst_id_hash);
     if (!udp)
         return TC_ACT_OK; // not our Geneve packet
 
     nh_port *nh_port_ptr = bpf_map_lookup_elem(&hash2nh, &src_id_hash);
-    if (!nh_port_ptr || nh_port_ptr->nh != saddr || nh_port_ptr->port != udp->source) {
-        bpf_printk("udp ingress: Updating hash2nh, id hash: %08x saddr: %08x -> %08x port: %u -> %u",
+    bpf_printk("udp ingress: src_id_hash: %u", src_id_hash);
+    // NOTE: nh address will be in the geneve ingress filter. Here we update only the port (which is not 
+    // accesible from Geneve ingress gilter)
+    if (!nh_port_ptr || nh_port_ptr->port != udp->source) {
+        bpf_printk("udp ingress: Updating hash2nh, id hash: port: %u -> %u",
                     src_id_hash,
-                    nh_port_ptr ? bpf_ntohl(nh_port_ptr->nh) : 0,
-                    nh_port_ptr ? bpf_ntohs(nh_port_ptr->port) : 0);
-        nh_port nhp = { saddr, udp->source };
-        long ret = bpf_map_update_elem(&hash2nh, &src_id_hash, &nhp, BPF_ANY);
-        if (ret < 0) {
-          bpf_printk("ingress: failed to update nh_port for ID hash %08x, saddr %08x port %u, error %ld", 
-           bpf_ntohl(src_id_hash), bpf_ntohl(saddr), bpf_ntohs(udp->source), ret);
-          return TC_ACT_SHOT;
+                    nh_port_ptr ? bpf_ntohs(nh_port_ptr->port) : 0, bpf_ntohs(udp->source));
+        if (!nh_port_ptr) {
+            nh_port nhp = { 0, udp->source };
+            long ret = bpf_map_update_elem(&hash2nh, &src_id_hash, &nhp, BPF_ANY);
+            if (ret < 0) {
+                bpf_printk("ingress: failed to update nh_port for ID hash %u with port %u, error %ld", 
+                    src_id_hash, bpf_ntohs(udp->source), ret);
+                return TC_ACT_SHOT;
+            }
+        } else {
+            nh_port_ptr->port = udp->source;
         }
-        bpf_printk("ingress: saved addr %08x and port %04x for id hash: %u", 
-            bpf_ntohl(saddr), bpf_ntohs(udp->source),bpf_ntohl(src_id_hash));
+        bpf_printk("udp ingress: saved port %u for id hash: %u", bpf_ntohs(udp->source), src_id_hash);
     }
 
     bpf_printk("udp ingress: done");
@@ -624,8 +647,8 @@ int udp_port_save(struct __sk_buff *skb)
 SEC("tc/egress")
 int udp_port_rewrite(struct __sk_buff *skb)
 {
-    __be32 saddr, daddr, src_id_hash, dst_id_hash;
-    struct udphdr *udp = geneve_udp_hdr(skb, &saddr, &daddr, &src_id_hash, &dst_id_hash);
+    __u32 src_id_hash, dst_id_hash;
+    struct udphdr *udp = geneve_udp_hdr(skb, &src_id_hash, &dst_id_hash);
     if (!udp)
         return TC_ACT_OK; // not our Geneve packet
 
@@ -633,8 +656,8 @@ int udp_port_rewrite(struct __sk_buff *skb)
     // If the peer is public then user_control adds it to the hash2nh map with port 6081
     // If the peer is private then ingress must add its address and port to the map first
     nh_port *nh_port_ptr = bpf_map_lookup_elem(&hash2nh, &dst_id_hash);
-    if (!nh_port_ptr) {
-        bpf_printk("udp egress: no saved peer nh and port for id hash %u, dropping ...", bpf_ntohl(dst_id_hash));
+    if (!nh_port_ptr || nh_port_ptr->nh == 0) {
+        bpf_printk("udp egress: peer nh is not known (yet?) for id hash %u, dropping ...", dst_id_hash);
         return TC_ACT_SHOT; // nh and port not known (yet)
     }
 
@@ -684,14 +707,13 @@ int udp_port_rewrite(struct __sk_buff *skb)
     }
 
     // Change the dest port back to the original if there is NAT/conntrack, i.e. if
-    // the ingress packet had a source port different from 6081.
+    // the peer has a source port different from 6081.
     old_port = udp->dest;
     new_port = nh_port_ptr->port;
     if (new_port == old_port) {
         bpf_printk("egress: dst port already %u, packet unchanged", bpf_ntohs(old_port));
         return TC_ACT_OK;
     }
-
     udp->dest = new_port;
 
     if (udp->check) {

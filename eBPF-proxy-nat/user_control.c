@@ -159,7 +159,8 @@ static int new_id_hash_to_maps(uint32_t hash, const char *ip_str, const char *nh
         return -1;
     }
 
-    // hash2nh
+    // hash2nh 
+    // NOTE nh must be in host order (le) because the set_tunnel_key() call converts it to network order
     union ip4 nh;
     if (strcmp(nh_str, "0.0.0.0")) {
         if (ip4_ptole(nh_str, &nh) < 0) {
@@ -172,8 +173,8 @@ static int new_id_hash_to_maps(uint32_t hash, const char *ip_str, const char *nh
             return -1;
         }
     } else {
+        // peer site is private, nh is not known yet
         nh.num = 0;
-        // it is a private site, nh is not known yet
     }
 
     printf("[+] IP <-> hash: hash %-5d  ind %d "
