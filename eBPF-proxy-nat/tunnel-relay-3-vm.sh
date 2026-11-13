@@ -18,7 +18,7 @@ set -euo pipefail
 # My custom TLV option 12 bytes
 # total 48 bytes
 # physycal iface (ens3) mtu is 1500
-MTU=1552
+MTU=1452
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
