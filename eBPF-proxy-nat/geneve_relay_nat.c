@@ -12,7 +12,7 @@
 #define LOG_ERROR 2
 
 // Current log level
-#define LOG_LEVEL LOG_INFO
+#define LOG_LEVEL LOG_ERROR
 
 // virtual network ID (must be less than 256 to fit into a dingle byte)
 #define VNI 42
