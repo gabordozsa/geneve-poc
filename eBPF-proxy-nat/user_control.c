@@ -344,7 +344,7 @@ int init_ebpf_maps(struct bpf_object *obj, uint32_t num_remote_proxies, char **a
 }
 
 void usage(char *argv0) {
-    fprintf(stderr, "Usage: %s <geneve_iface> <udp_iface> <local_id_hash> <local_overlay_ip> <num_remote_proxies [1..255]>\n"
+    fprintf(stderr, "Usage: %s <geneve_iface> <udp_iface|none> <local_id_hash> <local_overlay_ip> <num_remote_proxies [1..255]>\n"
                 "<remote_id_hash> <remote_overlay_ip> <nh_underlay_ip> ...", argv0);
 }
 
@@ -366,10 +366,13 @@ int main(int argc, char **argv)
     if (!strcmp(udp_iface, "none")) {
         udp_iface = NULL; // udp_iface is optional
     }
-    unsigned int udp_ifindex = if_nametoindex(udp_iface);
-    if (udp_ifindex == 0) {
-        perror("[-] if_nametoindex for udp iface");
-        return EXIT_FAILURE;
+    unsigned int udp_ifindex = 0;
+    if (udp_iface) {
+        udp_ifindex = if_nametoindex(udp_iface);
+        if (udp_ifindex == 0) {
+            perror("[-] if_nametoindex for udp iface");
+            return EXIT_FAILURE;
+        }
     }
 
     uint32_t local_id_hash = (uint32_t)strtoul(argv[3], NULL, 10);
