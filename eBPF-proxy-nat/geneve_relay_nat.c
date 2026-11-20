@@ -521,9 +521,10 @@ int geneve_egress_rewrite(struct __sk_buff *skb)
 /*
  * Parse an Ethernet/IPv4/UDP packet. Returns a pointer to the UDP header
  * if the packet is a non-fragmented IPv4 UDP packet with destination port
- * GENEVE_PORT, NULL otherwise.
+ * GENEVE_PORT and our custom Geneve options, NULL otherwise
  */
-static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __u32 *src_id_hash, __u32 *dst_id_hash, __u8 *inner_proto)
+static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __u32 *src_id_hash, __u32 *dst_id_hash, 
+    struct iphdr **outer_ip, __u8 *inner_proto)
 {
     void *data_end = (void *)(long)skb->data_end;
     void *data     = (void *)(long)skb->data;
@@ -552,7 +553,7 @@ static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __u3
     if (udp->dest != bpf_htons(GENEVE_PORT))
         return NULL;
 
-    // Check if the packet has the expected Geneve optio, i.e. it is one of our Geneve packet
+    // Check if the packet has the expected Geneve options, i.e. it is one of our Geneve packet
     // TODO : make this simpler: only check if inner source IP == LOCAL_OVERLAY_IP (which is common for all sites)
     // That would make it sure that it is a Geneve packet from one of our Geneve iface ....
     struct genevehdr *gen = (void *)(udp + 1);
@@ -582,6 +583,7 @@ static __always_inline struct udphdr *geneve_udp_hdr(struct __sk_buff *skb, __u3
     // Option layout is [dest ID hash][src ID hash]
     *dst_id_hash = opt->opt_data[0];
     *src_id_hash = opt->opt_data[1];
+    *outer_ip = ip; 
     *inner_proto = inner_ip->protocol;
 
     return udp;
@@ -593,14 +595,15 @@ int udp_port_save(struct __sk_buff *skb)
 {
     __u8 inner_proto;
     __u32 src_id_hash, dst_id_hash;
-    struct udphdr *udp = geneve_udp_hdr(skb, &src_id_hash, &dst_id_hash, &inner_proto);
+    struct iphdr *ip;
+    struct udphdr *udp = geneve_udp_hdr(skb, &src_id_hash, &dst_id_hash, &ip, &inner_proto);
     if (!udp)
         return TC_ACT_OK; // not our Geneve packet
 
     nh_port *nh_port_ptr = bpf_map_lookup_elem(&hash2nh, &src_id_hash);
     log_udp(LOG_INFO, "ingress: src_id_hash: %u", src_id_hash);
-    // NOTE: nh address will be in the geneve ingress filter. Here we update only the port (which is not 
-    // accesible from Geneve ingress gilter)
+    // NOTE: nh address is saved in the geneve ingress filter. Here we update only the port (which is not
+    // accesible from the Geneve filter)
     if (!nh_port_ptr || nh_port_ptr->port != udp->source) {
         log_udp(LOG_INFO, "ingress: Updating hash2nh, id hash %u port: %u -> %u",
                     src_id_hash,
@@ -624,13 +627,25 @@ int udp_port_save(struct __sk_buff *skb)
     return TC_ACT_OK;
 }
 
+// Calculate the pseudo header csum (used by the outer UDP csum)
+static __always_inline __u32 pseudo_header_csum(__be32 ip_saddr, __be32 ip_daddr, __u8 ip_proto, __be16 udp_len) {
+    __u32 saddr = bpf_ntohl(ip_saddr);
+    __u32 daddr = bpf_ntohl(ip_daddr);
+    __u32 pseudo = (saddr >> 16) + (saddr & 0xffff) + (daddr >> 16) + (daddr & 0xffff)
+                 + ip_proto + bpf_ntohs(udp_len);
+    pseudo = (pseudo & 0xffff) + (pseudo >> 16);
+    pseudo = (pseudo & 0xffff) + (pseudo >> 16);
+    return pseudo;
+}
+
 /* Egress: rewrite the dest port of UDP packets sent to port 6081 */
 SEC("tc/egress")
 int udp_port_rewrite(struct __sk_buff *skb)
 {
     __u8 inner_proto;
     __u32 src_id_hash, dst_id_hash;
-    struct udphdr *udp = geneve_udp_hdr(skb, &src_id_hash, &dst_id_hash, &inner_proto);
+    struct iphdr *ip;
+    struct udphdr *udp = geneve_udp_hdr(skb, &src_id_hash, &dst_id_hash, &ip, &inner_proto);
     if (!udp)
         return TC_ACT_OK; // not our Geneve packet
 
@@ -649,7 +664,9 @@ int udp_port_rewrite(struct __sk_buff *skb)
     asm volatile("" : "+r"(udp_off));
     __u32 csum_off  = udp_off + offsetof(struct udphdr, check);
 
-    // DEBUG: outer UDP csum before any change (compare with tcpdump on the sender)
+    // Compute the pseudo header csum
+    __u32 pseudo = pseudo_header_csum(ip->saddr, ip->daddr, ip->protocol, udp->len);
+
     log_udp(LOG_INFO, "egress: DEBUG outer udp csum before: %04x (ports %u -> %u)",
         bpf_ntohs(udp->check), bpf_ntohs(udp->source), bpf_ntohs(udp->dest));
 
@@ -671,6 +688,14 @@ int udp_port_rewrite(struct __sk_buff *skb)
         csum_v1 = new_port;
         csum_v2 = old_port;
     }
+
+    // Sanity check
+    if ((lco_csum == 1) != (pseudo != bpf_ntohs(udp->check))) {
+        log_udp(LOG_ERROR, "LCO logic missmatch: inner proto %02x, lco_sum %d, pseudo %08x, udp csum %04x, dropping ...",
+            inner_proto, lco_csum, pseudo, bpf_ntohs(udp->check));
+        return TC_ACT_SHOT;
+    }
+
     udp->source = new_port;
     if (udp->check) {
         if (bpf_l4_csum_replace(skb, csum_off, csum_v1, csum_v2, csum_flags) < 0) {
@@ -678,12 +703,26 @@ int udp_port_rewrite(struct __sk_buff *skb)
             return TC_ACT_SHOT;
         }
     }
-    log_udp(LOG_INFO, "egress: src port changed to %u", GENEVE_PORT);
 
     // Need to re-validate udp pointer after calling bpf_l4_csum_replace()
     void *data_end = (void *)(long)skb->data_end;
     void *data     = (void *)(long)skb->data;
 
+    if (udp_off > 128) {
+        log_udp(LOG_ERROR, "egress: UDP offset too large, dropping ...");
+        return TC_ACT_SHOT;
+    }
+    udp_off &= 0x7f;
+    udp = (void *)((char *)data + udp_off);
+    if ((void *)(udp + 1) > data_end) {
+        log_udp(LOG_ERROR, "egress: innner UDP header error, dropping ...");
+        return TC_ACT_SHOT;
+    }
+
+    udp = data + udp_off;
+    log_udp(LOG_INFO, "egress: DEBUG src port changed to %u, outer udp csum %04x", GENEVE_PORT, bpf_ntohs(udp->check));
+
+    /*
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) {
          log_udp(LOG_ERROR, "egress: FATAL eth header");
@@ -708,28 +747,14 @@ int udp_port_rewrite(struct __sk_buff *skb)
         log_udp(LOG_ERROR, "egress: FATAL udp header");
         return TC_ACT_SHOT;
     }
-
-
-    // DEBUG: outer IPv4 pseudo-header sum (src IP, dst IP, protocol, UDP length), folded to 16 bits.
-    // If it equals the outer udp->check, that field is a seed (CHECKSUM_PARTIAL), not a final checksum.
-    __u32 saddr = bpf_ntohl(ip->saddr);
-    __u32 daddr = bpf_ntohl(ip->daddr);
-    __u32 pseudo = (saddr >> 16) + (saddr & 0xffff) + (daddr >> 16) + (daddr & 0xffff)
-                 + ip->protocol + bpf_ntohs(udp->len);
-    pseudo = (pseudo & 0xffff) + (pseudo >> 16);
-    pseudo = (pseudo & 0xffff) + (pseudo >> 16);
-    log_udp(LOG_INFO, "egress: DEBUG outer pseudo-header sum: %04x, udp csum: %04x",
-        pseudo, bpf_ntohs(udp->check));
-    log_udp(LOG_INFO, "egress: DEBUG gso_size: %u gso_segs: %u len: %u",
-        skb->gso_size, skb->gso_segs, skb->len);
-
+    */
     // Change the dest port back to the original if there is NAT/conntrack, i.e. if
     // the peer has a source port different from 6081.
 
     old_port = udp->dest;
     new_port = nh_port_ptr->port;
     if (new_port == old_port) {
-        log_udp(LOG_INFO, "egress: dst port already %u, no change needed, outer udp csum: %04x",
+        log_udp(LOG_INFO, "egress: DEBUG dst port already %u, no change needed, outer udp csum: %04x",
             bpf_ntohs(old_port), bpf_ntohs(udp->check));
         return TC_ACT_OK;
     }
@@ -750,7 +775,7 @@ int udp_port_rewrite(struct __sk_buff *skb)
     // DEBUG: final outer UDP csum (udp pointer is invalid after the helper call, reload the bytes)
     __be16 final_csum = 0;
     bpf_skb_load_bytes(skb, csum_off, &final_csum, sizeof(final_csum));
-    log_udp(LOG_INFO, "egress: rewrote dst port %u -> %u, DEBUG outer udp csum after: %04x",
+    log_udp(LOG_INFO, "egress: DEBUG rewrote dst port %u -> %u, DEBUG outer udp csum after: %04x",
         bpf_ntohs(old_port), bpf_ntohs(new_port), bpf_ntohs(final_csum));
 
     log_udp(LOG_INFO, "egress DONE");
