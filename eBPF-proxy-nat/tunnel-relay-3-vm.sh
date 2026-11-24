@@ -4,7 +4,7 @@
 #
 #   [vs-1] Fyre      [vs-2] Fyre    [vs-3] IBMCloud
 #   geneve0          geneve0        geneve0
-#   0.0.0.0          0.0.0.0        13.121.90.155 (floating IP)
+#   0.0.0.0          0.0.0.0        13.120.93.41 (floating IP)
 #.  ID 100           ID 200         ID 300
 #
 # Run as root.  Cleans up on exit.
@@ -46,7 +46,7 @@ POC_DIR=/home/ubuntu/geneve-poc
 
 # control plane to attach and configure ingress/egress ebpf tc filters
 USER_CONTROL=$POC_DIR/eBPF-proxy-nat/user_control
- 
+
 
 # Launch proxies in ns-left ans ns-right
 PROXY="$POC_DIR/proxy"
@@ -91,7 +91,7 @@ ID_HASH[VS3]=300
 declare -A UNDERLAY
 UNDERLAY[VS1]="0.0.0.0"
 UNDERLAY[VS2]="0.0.0.0"
-UNDERLAY[VS3]="13.121.90.155"
+UNDERLAY[VS3]="13.120.93.41"
 
 
 declare -A OVERLAY
