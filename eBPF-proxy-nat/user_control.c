@@ -4,6 +4,13 @@
 #include <fcntl.h>
 #include <string.h>
 #include <signal.h>
+#include <errno.h>
+#include <poll.h>
+#include <time.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <libelf.h>
@@ -14,6 +21,26 @@
 #define MY_EBPF_OBJ "geneve_relay_nat.o"
 
 #define GENEVE_PORT 6081
+
+// Hello protocol between neighbors. Hellos are sent through the overlay (geneve0) from/to
+// <overlay ip>:HELLO_PORT, i.e. the eBPF filters route/NAT them like any other overlay packet.
+#define HELLO_PORT       6082
+#define HELLO_PERIOD_MS  5000   // period of new hellos to the same neighbor
+#define HELLO_RETRY_MS   2000   // re-send the same hello if no reply arrives within this time
+#define HELLO_MAX_POLL_MS 1000  // upper bound for poll() timeout so g_stop is noticed promptly
+
+#define HELLO_TYPE_HELLO 1
+#define HELLO_TYPE_REPLY 2
+
+
+#define LOG_INFO  1
+#define LOG_ERROR 2
+
+#define LOG_LEVEL LOG_INFO
+
+#define log(level, fmt, args...) if (level >= LOG_LEVEL) printf("[%08x] " fmt,  g_local_id_hash, ##args)
+
+
 
 // next-hop underlay IP and outer UDP dest port.
 // Used as value type in the hash2nh ebpf map (to handle NAT/conntrack)
@@ -100,6 +127,35 @@ union ip4 {
 // ebpf maps
 static int ip2hash_fd, hash2ip_fd, hash2ind_fd, ind2hash_fd, hash2nh_fd;
 
+/* ── Remote proxies / hello state ────────────────────────────────────────── */
+#define MAX_REMOTES 255
+
+typedef struct remote {
+    uint32_t hash;          // remote ID hash
+    uint32_t overlay_ip;    // local overlay IP of the remote (network byte order)
+    bool     neighbor;      // remote is a neighbor (cmd line arg)
+    bool     send_hello;    // neighbor with a known (not 0.0.0.0) static nh address
+    uint32_t counter;       // counter of the last new hello sent (0 = none yet)
+    bool     awaiting;      // hello sent, reply not received yet
+    int64_t  next_due_ms;   // when to send the next new hello
+    int64_t  last_new_ms;   // when the last new hello was sent
+    int64_t  retry_due_ms;  // when to re-send the outstanding hello
+} remote;
+
+static remote g_remotes[MAX_REMOTES];
+static int g_num_remotes = 0;
+
+// Hello message. All fields are in network byte order.
+typedef struct hello_msg {
+    uint32_t type;          // HELLO_TYPE_HELLO or HELLO_TYPE_REPLY
+    uint32_t sender_id;     // ID hash of the sender (local_id_hash)
+    uint32_t counter;       // hello counter. Echoed back unchanged in the reply
+} hello_msg;
+
+static int g_hello_sock = -1;
+static uint32_t g_local_id_hash;
+
+
 
 static int ip4_ptole(const char *p, union ip4 *r) {
     int n = sscanf(p, "%hhu.%hhu.%hhu.%hhu", r->octets + 3, r->octets + 2, r->octets + 1, r->octets);
@@ -121,7 +177,7 @@ static int ip4_ptobe(const char *p, union ip4 *r) {
     return 0;
 }
 
-static int new_id_hash_to_maps(uint32_t hash, const char *ip_str, const char *nh_str) {
+static int new_id_hash_to_maps(uint32_t hash, const char *ip_str, const char *nh_str, bool neighbor) {
     union ip4 ip;
     static uint32_t index = 1;
 
@@ -162,7 +218,8 @@ static int new_id_hash_to_maps(uint32_t hash, const char *ip_str, const char *nh
     // hash2nh 
     // NOTE nh must be in host order (le) because the set_tunnel_key() call converts it to network order
     union ip4 nh;
-    if (strcmp(nh_str, "0.0.0.0")) {
+    bool nh_known = strcmp(nh_str, "0.0.0.0") != 0;
+    if (nh_known) {
         if (ip4_ptole(nh_str, &nh) < 0) {
             fprintf(stderr, "[-] Invalid nh IP: %s for hash %d\n", nh_str, hash);
             return -1;
@@ -177,10 +234,21 @@ static int new_id_hash_to_maps(uint32_t hash, const char *ip_str, const char *nh
         nh.num = 0;
     }
 
-    printf("[+] IP <-> hash: hash %-5d  ind %d "
+    // Remember the remote for the hello protocol. Only neighbors with a known static nh are probed.
+    if (g_num_remotes >= MAX_REMOTES) {
+        fprintf(stderr, "[-] Too many remote proxies\n");
+        return -1;
+    }
+    remote *r = &g_remotes[g_num_remotes++];
+    r->hash = hash;
+    r->overlay_ip = ip.num;
+    r->neighbor = neighbor;
+    r->send_hello = neighbor && nh_known;
+
+    printf("[+] IP <-> hash: hash %-5d  ind %d neighbor %d "
             "ip %-15s 0x%-8x ip[0] %02x ip[1] %02x ip[2] %02x ip[3] %02x "
             "nh %-15s 0x%-8x nh[0] %02x nh[1] %02x nh[2] %02x nh[3] %02x\n",
-            hash, index,
+            hash, index, neighbor,
             ip_str, ip.num, ip.octets[0],  ip.octets[1],  ip.octets[2],  ip.octets[3],
             nh_str, nh.num, nh.octets[0],  nh.octets[1],  nh.octets[2],  nh.octets[3]);
     index += 1;
@@ -323,7 +391,7 @@ int init_ebpf_maps(struct bpf_object *obj, uint32_t num_remote_proxies, char **a
     // hash2nh
     routes_map = bpf_object__find_map_by_name(obj, "hash2nh");
     hash2nh_fd = bpf_map__fd(routes_map);
-    if (hash2ind_fd < 0) {
+    if (hash2nh_fd < 0) {
         fprintf(stderr, "[-] map 'hash2nh' not found\n");
         bpf_object__close(obj);
         return EXIT_FAILURE;
@@ -334,18 +402,166 @@ int init_ebpf_maps(struct bpf_object *obj, uint32_t num_remote_proxies, char **a
         uint32_t hash = (uint32_t)strtoul(argv[arg_offset], NULL, 10);
         const char *ip_str = argv[arg_offset + 1];
         const char *nh_str = argv[arg_offset + 2];
-        int ret = new_id_hash_to_maps(hash, ip_str, nh_str);
+        const char *nbr_str = argv[arg_offset + 3];
+        if (strcmp(nbr_str, "0") && strcmp(nbr_str, "1")) {
+            fprintf(stderr, "[-] Invalid is_neighbor value '%s' for hash %u (must be 0 or 1)\n", nbr_str, hash);
+            return -1;
+        }
+        int ret = new_id_hash_to_maps(hash, ip_str, nh_str, nbr_str[0] == '1');
         if (ret != 0) {
             return ret;
         }
-        arg_offset += 3;
+        arg_offset += 4;
     }
     return 0;
 }
 
+/* ── Hello protocol ──────────────────────────────────────────────────────── */
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static remote *find_remote(uint32_t hash) {
+    for (int i = 0; i < g_num_remotes; i++) {
+        if (g_remotes[i].hash == hash)
+            return &g_remotes[i];
+    }
+    return NULL;
+}
+
+static void hello_send(const struct sockaddr_in *to, uint32_t type, uint32_t sender_id, uint32_t counter) {
+    hello_msg msg = { htonl(type), htonl(sender_id), htonl(counter) };
+    if (sendto(g_hello_sock, &msg, sizeof(msg), 0, (const struct sockaddr *)to, sizeof(*to)) < 0)
+        perror("[-] hello sendto");
+}
+
+static void hello_send_to_remote(const remote *r, uint32_t counter) {
+    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(HELLO_PORT) };
+    to.sin_addr.s_addr = r->overlay_ip;
+    hello_send(&to, HELLO_TYPE_HELLO, g_local_id_hash, counter);
+}
+
+// Create the UDP socket used to both send and receive hello messages. It is bound to
+// <local overlay ip>:HELLO_PORT (the eBPF UDP filters require the inner source IP to be
+// LOCAL_OVERLAY_IP).
+static int hello_init(uint32_t local_id_hash, const char *local_overlay_ip) {
+    union ip4 ip;
+    if (ip4_ptobe(local_overlay_ip, &ip) < 0)
+        return -1;
+
+    g_local_id_hash = local_id_hash;
+    g_hello_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_hello_sock < 0) {
+        perror("[-] hello socket");
+        return -1;
+    }
+    int one = 1;
+    setsockopt(g_hello_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(HELLO_PORT) };
+    addr.sin_addr.s_addr = ip.num;
+    if (bind(g_hello_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("[-] hello bind");
+        close(g_hello_sock);
+        g_hello_sock = -1;
+        return -1;
+    }
+
+    int64_t now = now_ms();
+    for (int i = 0; i < g_num_remotes; i++)
+        g_remotes[i].next_due_ms = now; // first hello goes out immediately
+    printf("[+] Hello socket bound to %s:%d\n", local_overlay_ip, HELLO_PORT);
+    return 0;
+}
+
+static void hello_receive(void) {
+    for (;;) {
+        hello_msg msg;
+        struct sockaddr_in from;
+        socklen_t fromlen = sizeof(from);
+        ssize_t n = recvfrom(g_hello_sock, &msg, sizeof(msg), MSG_DONTWAIT,
+                             (struct sockaddr *)&from, &fromlen);
+        if (n < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                perror("[-] hello recvfrom");
+            return;
+        }
+        if (n != sizeof(msg))
+            continue;
+
+        uint32_t type = ntohl(msg.type);
+        uint32_t sender = ntohl(msg.sender_id);
+        uint32_t counter = ntohl(msg.counter);
+
+        if (type == HELLO_TYPE_HELLO) {
+            log(LOG_INFO, "[hello] received hello from id %u counter %u, sending reply\n", sender, counter);
+            hello_send(&from, HELLO_TYPE_REPLY, g_local_id_hash, counter);
+        } else if (type == HELLO_TYPE_REPLY) {
+            remote *r = find_remote(sender);
+            if (!r || !r->send_hello || !r->awaiting || r->counter != counter) {
+                log(LOG_INFO, "[hello] ignoring reply from id %u counter %u\n", sender, counter);
+                continue;
+            }
+            int64_t now = now_ms();
+            log(LOG_INFO, "[hello] reply from id %u counter %u rtt %lld ms\n", sender, counter,
+                   (long long)(now - r->last_new_ms));
+            r->awaiting = false;
+            r->next_due_ms = r->last_new_ms + HELLO_PERIOD_MS;
+        }
+    }
+}
+
+// One iteration of the hello loop: wait for incoming hello/reply messages or the next
+// timer, handle received messages, send new hellos and re-send unanswered ones.
+static void hello_neighbor(void) {
+    int64_t now = now_ms();
+    int64_t wake = now + HELLO_MAX_POLL_MS;
+    for (int i = 0; i < g_num_remotes; i++) {
+        const remote *r = &g_remotes[i];
+        if (!r->send_hello)
+            continue;
+        int64_t due = r->awaiting ? r->retry_due_ms : r->next_due_ms;
+        if (due < wake)
+            wake = due;
+    }
+    int timeout = wake > now ? (int)(wake - now) : 0;
+
+    struct pollfd pfd = { .fd = g_hello_sock, .events = POLLIN };
+    int ret = poll(&pfd, 1, timeout);
+    if (ret < 0) {
+        if (errno != EINTR)
+            perror("[-] hello poll");
+        return;
+    }
+    if (ret > 0 && (pfd.revents & POLLIN))
+        hello_receive();
+
+    now = now_ms();
+    for (int i = 0; i < g_num_remotes; i++) {
+        remote *r = &g_remotes[i];
+        if (!r->send_hello)
+            continue;
+        if (!r->awaiting && now >= r->next_due_ms) {
+            r->counter++;
+            r->awaiting = true;
+            r->last_new_ms = now;
+            r->retry_due_ms = now + HELLO_RETRY_MS;
+            log(LOG_INFO, "[hello] sending hello to id %u counter %u\n", r->hash, r->counter);
+            hello_send_to_remote(r, r->counter);
+        } else if (r->awaiting && now >= r->retry_due_ms) {
+            r->retry_due_ms = now + HELLO_RETRY_MS;
+            log(LOG_INFO, "[hello] no reply from id %u, re-sending hello counter %u\n", r->hash, r->counter);
+            hello_send_to_remote(r, r->counter);
+        }
+    }
+}
+
 void usage(char *argv0) {
     fprintf(stderr, "Usage: %s <geneve_iface> <udp_iface|none> <local_id_hash> <local_overlay_ip> <num_remote_proxies [1..255]>\n"
-                "<remote_id_hash> <remote_overlay_ip> <nh_underlay_ip> ...", argv0);
+                "<remote_id_hash> <remote_overlay_ip> <nh_underlay_ip> <is_neighbor 0|1> ...\n", argv0);
 }
 
 int main(int argc, char **argv)
@@ -383,7 +599,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (argc < 6 + (int)(3 * num_remote_proxies)) {
+    if (argc < 6 + (int)(4 * num_remote_proxies)) {
         usage(argv[0]);
         return EXIT_FAILURE;
     }
@@ -412,6 +628,12 @@ int main(int argc, char **argv)
     ret = init_ebpf_maps(obj, num_remote_proxies, argv);
     if (ret)
         return EXIT_FAILURE;
+
+    // Create the hello socket (needs the remotes parsed by init_ebpf_maps())
+    if (hello_init(local_id_hash, local_overlay_ip) < 0) {
+        bpf_object__close(obj);
+        return EXIT_FAILURE;
+    }
 
     /* ── 3. Find programs by name ────────────────────────────────────────── */
     struct bpf_program *geneve_ingress_prog =
@@ -480,7 +702,7 @@ int main(int argc, char **argv)
     }
     //printf("\nRunning — press Ctrl-C to detach and stop...\n");
     while (!g_stop)
-        pause();
+        hello_neighbor();
 
     /* ── 7. Cleanup ──────────────────────────────────────────────────────── */
     printf("\n[*] Caught SIGINT, cleaning up...\n");
@@ -488,6 +710,7 @@ int main(int argc, char **argv)
     bpf_tc_detach(&g_gen_ingress_hook, &g_gen_ingress_opts);
     bpf_tc_detach(&g_udp_ingress_hook, &g_udp_ingress_opts);
     bpf_tc_detach(&g_udp_egress_hook, &g_udp_egress_opts);
+    close(g_hello_sock);
     bpf_object__close(obj);
     return EXIT_SUCCESS;
 }
