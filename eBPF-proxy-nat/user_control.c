@@ -25,8 +25,8 @@
 // Hello protocol between neighbors. Hellos are sent through the overlay (geneve0) from/to
 // <overlay ip>:HELLO_PORT, i.e. the eBPF filters route/NAT them like any other overlay packet.
 #define HELLO_PORT       6082
-#define HELLO_PERIOD_MS  5000   // period of new hellos to the same neighbor
-#define HELLO_RETRY_MS   2000   // re-send the same hello if no reply arrives within this time
+#define HELLO_PERIOD_MS  10000   // period of new hellos to the same neighbor
+#define HELLO_RETRY_MS    2000   // re-send the same hello if no reply arrives within this time
 #define HELLO_MAX_POLL_MS 1000  // upper bound for poll() timeout so g_stop is noticed promptly
 
 #define HELLO_TYPE_HELLO 1
