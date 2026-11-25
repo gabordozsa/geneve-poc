@@ -36,7 +36,7 @@
 #define LOG_INFO  1
 #define LOG_ERROR 2
 
-#define LOG_LEVEL LOG_INFO
+#define LOG_LEVEL LOG_ERROR
 
 #define log(level, fmt, args...) if (level >= LOG_LEVEL) printf("[%08x] " fmt,  g_local_id_hash, ##args)
 
