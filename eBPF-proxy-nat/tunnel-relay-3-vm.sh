@@ -173,8 +173,12 @@ elif [[ $SITE = "VS1" ]]; then
     echo ""
 fi
 
-info "Done.  Press Enter to tear down."
-read -r
+info "Done.  Press Ctrl-C to tear down."
 
-kill $uc_pid
-wait $uc_pid
+# Only Ctrl-C (SIGINT) from the user triggers teardown: forward it to user_control.
+trap 'kill -INT $uc_pid 2>/dev/null || true' INT
+
+# The first wait is interrupted by the trapped SIGINT; the second one waits for
+# user_control to actually finish detaching its filters before cleanup() runs.
+wait $uc_pid || true
+wait $uc_pid || true
