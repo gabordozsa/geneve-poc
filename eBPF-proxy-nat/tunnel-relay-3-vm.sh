@@ -41,21 +41,31 @@ trap cleanup EXIT
 [[ $1 =~ VS1|VS2|VS3 ]] || die "Site must be [VS1|VS2|VS3]"
 SITE=$1
 
-POC_DIR=/home/ubuntu/geneve-poc
-[[ $SITE == VS3 ]] ||POC_DIR=/home/gabor/geneve-poc
+HOME_DIR=/home/gabor
+[[ $SITE == VS3 ]] && HOME_DIR=/home/ubuntu
+POC_DIR=$HOME_DIR/geneve-poc
 
 # control plane to attach and configure ingress/egress ebpf tc filters
 USER_CONTROL=$POC_DIR/eBPF-proxy-nat/user_control
 
 
 # Launch proxies in ns-left ans ns-right
-PROXY="$POC_DIR/proxy"
+PROXY="$POC_DIR/proxy-v2"
 CERTS_DIR="$POC_DIR/certs"
 
 USE_TLS="${USE_TLS:-1}"          # set to any non-empty value to enable TLS between proxies
 
-PROXY_PORT="5201"   # port the two proxy instances communicate on
-BACKEND_PORT="5301"    # server port 
+# proxy listen ports for remote TLS connections (forwarded to local backends)
+PROXY_LPORT_TLS_1="5201"
+PROXY_LPORT_TLS_2="5202"
+# proxy local backend ports
+BACKEND_PORT_1="5301"
+BACKEND_PORT_2="5302"
+# proxy listens non-TLS ports for local clients to be forwarded to remote backends
+PROXY_LPORT_11=5411
+PROXY_LPORT_12=5412
+PROXY_LPORT_21=5421
+PROXY_LPORT_22=5422
 
 if [[ ! -x "$PROXY" ]]; then
     echo "Site $SITE error: proxy binary not found at $PROXY" >&2
@@ -89,8 +99,8 @@ ID_HASH[VS2]=200
 ID_HASH[VS3]=300
 
 declare -A UNDERLAY
-UNDERLAY[VS1]="0.0.0.0"
-UNDERLAY[VS2]="0.0.0.0"
+UNDERLAY[VS1]="0.0.0.0"      # private site
+UNDERLAY[VS2]="0.0.0.0"      # private site
 UNDERLAY[VS3]="13.120.93.41"
 
 
@@ -131,47 +141,36 @@ popd >/dev/null
 # ---------------------------------------------------------------------------
 # 3. Print proxy commands
 # ---------------------------------------------------------------------------
-# Server-side proxy at VS4
-if [[ -n "$USE_TLS" ]]; then
-    SERVER_PROXY_CMD=("$PROXY" -l "$PROXY_PORT" -r "127.0.0.1" -p "$BACKEND_PORT" -L -D -n server)
-else
-    SERVER_PROXY_CMD=("$PROXY" -l "$PROXY_PORT" -r "127.0.0.1" -p "$BACKEND_PORT" -D -n server)
-fi
-
-# Client-side proxy : connect to VS4 (which is locally identified by 92.168.42.4) via Geneve hops VS1 -> VS2 ->VS3 -> VS4
-if [[ -n "$USE_TLS" ]]; then
-    CLIENT_PROXY_CMD=("$PROXY" -l "$PROXY_PORT" -r 192.168.42.4 -p "$PROXY_PORT" -R -n client)
-else
-    CLIENT_PROXY_CMD=("$PROXY" -l "$PROXY_PORT" -r 192.168.42.4 -p "$PROXY_PORT" -n client)
-fi
+[[  -n "$USE_TLS" ]] && TLS="-S"
+PROXY_ARGS="-c $PROXY_LPORT_TLS_1$TLS:0.0.0.0:$BACKEND_PORT_1 -c $PROXY_LPORT_TLS_2$TLS:0.0.0.0:$BACKEND_PORT_2"
+case $SITE in
+    VS3)
+        PROXY_ARGS+=" -c $PROXY_LPORT_11:192.168.42.31:$PROXY_LPORT_TLS_1$TLS -c $PROXY_LPORT_12:192.168.42.31:$PROXY_LPORT_TLS_2$TLS"
+        PROXY_ARGS+=" -c $PROXY_LPORT_21:192.168.42.32:$PROXY_LPORT_TLS_1$TLS -c $PROXY_LPORT_22:192.168.42.32:$PROXY_LPORT_TLS_2$TLS"
+        PROXY_CMD="$PROXY $PROXY_ARGS"
+        ;;
+    *)
+        PROXY_CMD="$PROXY $PROXY_ARGS"
+        ;;
+esac
 
 echo ""
 echo "==> Setup complete"
 
-if [[ $SITE = "VS3" ]]; then
-    echo ""
-    echo "Start the server-side proxy in a separate terminal:"
-    echo ""
-    printf '    '
-    printf '%q ' "${SERVER_PROXY_CMD[@]}"
-    echo ""
-    echo ""
-    echo "Start the HTTP server in the server namespace:"
-    echo ""
-    echo "    python3 -m http.server $BACKEND_PORT --directory $CERTS_DIR"
-    echo ""
-elif [[ $SITE = "VS1" ]]; then
-    echo ""
-    echo "Start the client-side proxy in a separate terminal:"
-    echo ""
-    printf '    '
-    printf '%q ' "${CLIENT_PROXY_CMD[@]}"
-    echo ""
-    echo "Test the web server through the proxy chain:"
-    echo ""
-    echo "    curl http://127.0.0.1:$PROXY_PORT/"
-    echo ""
-fi
+
+echo "Start the HTTP servers:"
+echo ""
+echo "    mkdir -p $HOME_DIR/server_1; echo \"<html><body>Hello from $SITE server_1</body><html>\" > $HOME_DIR/server_1/index.htm"
+echo "    python3 -m http.server $BACKEND_PORT_1 --directory $HOME_DIR/server_1"
+echo ""
+echo "    mkdir -p $HOME_DIR/server_2; echo \"<html><body>Hello from $SITE server_2</body><html>\" > $HOME_DIR/server_2/index.htm"
+echo "    python3 -m http.server $BACKEND_PORT_2 --directory $HOME_DIR/server_2"
+echo ""
+echo ""
+echo "Start proxy:"
+echo ""
+echo "    $PROXY_CMD"
+echo ""
 
 info "Done.  Press Ctrl-C to tear down."
 

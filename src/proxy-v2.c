@@ -1,28 +1,30 @@
 /*
  * proxy-v2.c — multi-port TCP proxy with independent TLS on each side
  *
- * Extends proxy.c with a range of listening ports:
+ * Extends proxy.c with several listening ports, each with its own target:
  *
- *   The proxy listens on  local_port, local_port+1, ..., local_port+num_ports-1.
- *   A client that connects to local_port+i is forwarded to
- *   remote_ip:(remote_port+i) over a NEW upstream connection that is opened
+ *   Every "-c local_port:remote_ip:remote_port" argument makes the proxy
+ *   listen on local_port.  A client that connects to local_port is forwarded
+ *   to remote_ip:remote_port over a NEW upstream connection that is opened
  *   when the client connects (upstream connections are always deferred, so
  *   there is no -D option).  Each accepted client is served by its own child
  *   process, so connections on different ports (or several on the same port)
  *   are relayed concurrently.  When either side closes, the other side is
  *   closed too.
  *
- *   TLS flags work as in proxy.c:
- *     -L  TLS on the listening (local) side — certs/server.crt + certs/server.key
- *     -R  TLS on the outgoing (remote) side — connects as TLS client
+ *   TLS is chosen per port, with an optional "-S" postfix on the port:
+ *     local_port-S   TLS on the listening (local) side — certs/server.crt + certs/server.key
+ *     remote_port-S  TLS on the outgoing (remote) side — connects as TLS client
  *
  * Usage:
- *   proxy-v2 -l <local_port> -r <remote_ip> -p <remote_port> [-N <num_ports>]
- *            [-L] [-R] [-n <name>] [-G]
+ *   proxy-v2 -c <local_port>[-S]:<remote_ip>:<remote_port>[-S] [-c ...]
+ *            [-n <name>] [-G]
  *
- *   -N  Number of consecutive ports to serve (num_ports, default 1)
+ *   -c  Connection mapping; may be repeated.  An IPv6 remote_ip may be
+ *       written with or without brackets, e.g. 8443:::1:443 or 8443:[::1]:443
+ *       Example: 8443-S:10.0.0.5:443-S  (TLS on both sides)
  *   -G  Debug logging
- *   -F/-S/-C are accepted and ignored for command-line compatibility.
+ *   -F/-C are accepted and ignored for command-line compatibility.
  *
  * Build:
  *   gcc -Wall -Wextra -std=c11 -D_GNU_SOURCE -O2 -g \
@@ -69,31 +71,32 @@ static void sig_handler(int sig)
 }
 
 typedef struct {
-    uint16_t    local_port;                     /* first port to listen on */
-    uint16_t    num_ports;                      /* number of ports         */
+    uint16_t    local_port;                     /* port to listen on       */
+    int         tls_local;                      /* TLS on incoming side    */
     char        remote_ip[INET6_ADDRSTRLEN];    /* upstream host           */
-    uint16_t    remote_port;                    /* first upstream port     */
-    int         use_tls_local;                  /* TLS on incoming side    */
-    int         use_tls_remote;                 /* TLS on outgoing side    */
+    uint16_t    remote_port;                    /* upstream port           */
+    int         tls_remote;                     /* TLS on outgoing side    */
+} conn_t;
+
+typedef struct {
+    conn_t     *conns;                          /* one entry per -c        */
+    size_t      num_conns;
     char        name[64];                       /* log prefix              */
 } proxy_cfg_t;
 
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s -l <local_port> -r <remote_ip> -p <remote_port> [-N <num_ports>] [-L] [-R] [-n <name>] [-G]\n"
+        "Usage: %s -c <local_port>[-S]:<remote_ip>:<remote_port>[-S] [-c ...] [-n <name>] [-G]\n"
         "\n"
-        "Required:\n"
-        "  -l <port>   First local TCP port to listen on\n"
-        "  -r <ip>     Remote IP address to connect to\n"
-        "  -p <port>   First remote TCP port to connect to\n"
+        "Required (repeatable):\n"
+        "  -c <spec>   Listen on local_port; forward each client to remote_ip:remote_port\n"
+        "              over a new upstream connection.  IPv6 may be bracketed.\n"
+        "              A \"-S\" postfix on local_port enables TLS for incoming connections\n"
+        "              (requires " SERVER_CERT " and " SERVER_KEY ");\n"
+        "              on remote_port it enables TLS for the outgoing connection.\n"
         "\n"
         "Optional:\n"
-        "  -N <num>    num_ports: listen on local_port .. local_port+num-1; a client of\n"
-        "              local_port+i is forwarded to remote_port+i (default 1)\n"
-        "  -L          Enable TLS for incoming connections (local side)\n"
-        "              Requires " SERVER_CERT " and " SERVER_KEY "\n"
-        "  -R          Enable TLS for the outgoing connections (remote side)\n"
         "  -n <name>   Name prefix for log messages (default: \"proxy-v2\")\n"
         "  -G          Debug logging\n"
         "  -h          Print this help and exit\n",
@@ -113,50 +116,97 @@ static int parse_port(const char *s, const char *what, uint16_t *out)
     return 0;
 }
 
+/*
+ * strip_tls_suffix() — if s ends in "-S", cut it off and set *tls to 1.
+ */
+static void strip_tls_suffix(char *s, int *tls)
+{
+    size_t n = strlen(s);
+    *tls = (n >= 2 && s[n - 2] == '-' && s[n - 1] == 'S');
+    if (*tls) s[n - 2] = '\0';
+}
+
+/*
+ * parse_conn() — parse "local_port[-S]:remote_ip:remote_port[-S]" into *c.
+ * The IP is whatever lies between the first and the last ':' so that IPv6
+ * addresses work; surrounding [] are stripped.
+ */
+static int parse_conn(const char *spec, conn_t *c)
+{
+    const char *first = strchr(spec, ':');
+    const char *last  = strrchr(spec, ':');
+    if (!first || first == last) {
+        fprintf(stderr, "error: '%s' is not local_port:remote_ip:remote_port\n", spec);
+        return -1;
+    }
+
+    char lport[10], rport[10], ip[INET6_ADDRSTRLEN + 2];
+    size_t llen = (size_t)(first - spec);
+    size_t ilen = (size_t)(last - first - 1);
+    if (llen >= sizeof(lport) || ilen >= sizeof(ip) || strlen(last + 1) >= sizeof(rport)) {
+        fprintf(stderr, "error: '%s' has an over-long field\n", spec);
+        return -1;
+    }
+    memcpy(lport, spec, llen);       lport[llen] = '\0';
+    memcpy(ip, first + 1, ilen);     ip[ilen]    = '\0';
+    strcpy(rport, last + 1);
+
+    char *ipstr = ip;
+    if (ilen >= 2 && ip[0] == '[' && ip[ilen - 1] == ']') {
+        ip[ilen - 1] = '\0';
+        ipstr = ip + 1;
+    }
+
+    union { struct in_addr v4; struct in6_addr v6; } tmp;
+    if (inet_pton(AF_INET,  ipstr, &tmp.v4) != 1 &&
+        inet_pton(AF_INET6, ipstr, &tmp.v6) != 1) {
+        fprintf(stderr, "error: '%s' is not a valid IP address\n", ipstr);
+        return -1;
+    }
+
+    strip_tls_suffix(lport, &c->tls_local);
+    strip_tls_suffix(rport, &c->tls_remote);
+    if (parse_port(lport, "local_port",  &c->local_port)  < 0) return -1;
+    if (parse_port(rport, "remote_port", &c->remote_port) < 0) return -1;
+    size_t iplen = strlen(ipstr);
+    if (iplen >= sizeof(c->remote_ip)) {
+        fprintf(stderr, "error: '%s' has an over-long field\n", spec);
+        return -1;
+    }
+    memcpy(c->remote_ip, ipstr, iplen + 1);
+    return 0;
+}
+
+static int add_conn(proxy_cfg_t *cfg, const char *spec)
+{
+    conn_t c;
+    if (parse_conn(spec, &c) < 0) return -1;
+
+    for (size_t i = 0; i < cfg->num_conns; i++) {
+        if (cfg->conns[i].local_port == c.local_port) {
+            fprintf(stderr, "error: local port %u given more than once\n", c.local_port);
+            return -1;
+        }
+    }
+    conn_t *n = realloc(cfg->conns, (cfg->num_conns + 1) * sizeof(*n));
+    if (!n) { perror("realloc"); return -1; }
+    cfg->conns = n;
+    cfg->conns[cfg->num_conns++] = c;
+    return 0;
+}
+
 static int parse_args(int argc, char *argv[], proxy_cfg_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     strncpy(cfg->name, "proxy-v2", sizeof(cfg->name) - 1);
-    cfg->num_ports = 1;
-
-    int local_set = 0, remote_set = 0, port_set = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "l:r:p:N:LRFSCGn:h")) != -1) {
+    while ((opt = getopt(argc, argv, "c:FCGn:h")) != -1) {
         switch (opt) {
-        case 'l':
-            if (parse_port(optarg, "local_port", &cfg->local_port) < 0) return -1;
-            local_set = 1;
+        case 'c':
+            if (add_conn(cfg, optarg) < 0) return -1;
             break;
-        case 'r': {
-            union { struct in_addr v4; struct in6_addr v6; } tmp;
-            if (inet_pton(AF_INET,  optarg, &tmp.v4) != 1 &&
-                inet_pton(AF_INET6, optarg, &tmp.v6) != 1) {
-                fprintf(stderr, "error: '%s' is not a valid IP address\n", optarg);
-                return -1;
-            }
-            strncpy(cfg->remote_ip, optarg, sizeof(cfg->remote_ip) - 1);
-            remote_set = 1;
-            break;
-        }
-        case 'p':
-            if (parse_port(optarg, "remote_port", &cfg->remote_port) < 0) return -1;
-            port_set = 1;
-            break;
-        case 'N': {
-            char *end;
-            errno = 0;
-            unsigned long v = strtoul(optarg, &end, 10);
-            if (errno != 0 || *end != '\0' || v == 0 || v > 65535) {
-                fprintf(stderr, "error: num_ports must be 1-65535\n");
-                return -1;
-            }
-            cfg->num_ports = (uint16_t)v;
-            break;
-        }
-        case 'L': cfg->use_tls_local  = 1; break;
-        case 'R': cfg->use_tls_remote = 1; break;
-        case 'F': case 'S': case 'C':       /* ignored legacy options */
+        case 'F': case 'C':                 /* ignored legacy options */
             break;
         case 'G': Debug = 1; break;
         case 'n':
@@ -172,16 +222,8 @@ static int parse_args(int argc, char *argv[], proxy_cfg_t *cfg)
         }
     }
 
-    if (!local_set)  { fprintf(stderr, "error: -l <local_port> is required\n");  return -1; }
-    if (!remote_set) { fprintf(stderr, "error: -r <remote_ip> is required\n");   return -1; }
-    if (!port_set)   { fprintf(stderr, "error: -p <remote_port> is required\n"); return -1; }
-
-    if ((unsigned)cfg->local_port + cfg->num_ports - 1 > 65535) {
-        fprintf(stderr, "error: local_port + num_ports - 1 exceeds 65535\n");
-        return -1;
-    }
-    if ((unsigned)cfg->remote_port + cfg->num_ports - 1 > 65535) {
-        fprintf(stderr, "error: remote_port + num_ports - 1 exceeds 65535\n");
+    if (cfg->num_conns == 0) {
+        fprintf(stderr, "error: at least one -c <local_port>[-S]:<remote_ip>:<remote_port>[-S] is required\n");
         return -1;
     }
     return 0;
@@ -667,12 +709,14 @@ static relay_closed_t relay_tls_tls(SSL *client_ssl, SSL *upstream_ssl)
 /* Per-connection handler (runs in a child process)                    */
 /* ------------------------------------------------------------------ */
 
-static void handle_connection(const proxy_cfg_t *cfg, SSL_CTX *server_ctx,
-                              int client_fd, uint16_t remote_port,
+static void handle_connection(const conn_t *conn,
+                              SSL_CTX *server_ctx, int client_fd,
                               const char *peer_str, uint16_t peer_port)
 {
+    const char *remote_ip   = conn->remote_ip;
+    uint16_t    remote_port = conn->remote_port;
     SSL *client_ssl = NULL;
-    if (cfg->use_tls_local) {
+    if (conn->tls_local) {
         client_ssl = tls_accept(client_fd, server_ctx);
         if (!client_ssl) {
             fprintf(stderr, "%s: local TLS handshake failed with %s:%u\n",
@@ -686,16 +730,16 @@ static void handle_connection(const proxy_cfg_t *cfg, SSL_CTX *server_ctx,
 
     /* Upstream connection is opened now, for this client only */
     fprintf(stderr, "%s: connecting to %s:%u%s ...\n", log_prefix,
-            cfg->remote_ip, remote_port, cfg->use_tls_remote ? " (TLS)" : "");
-    int upstream_fd = connect_to_remote(cfg->remote_ip, remote_port);
+            remote_ip, remote_port, conn->tls_remote ? " (TLS)" : "");
+    int upstream_fd = connect_to_remote(remote_ip, remote_port);
     if (upstream_fd < 0) {
         fprintf(stderr, "%s: upstream connect failed\n", log_prefix);
         close(client_fd);
         return;
     }
     SSL *upstream_ssl = NULL;
-    if (cfg->use_tls_remote) {
-        upstream_ssl = tls_connect(upstream_fd, cfg->remote_ip);
+    if (conn->tls_remote) {
+        upstream_ssl = tls_connect(upstream_fd, remote_ip);
         if (!upstream_ssl) {
             fprintf(stderr, "%s: remote TLS handshake failed\n", log_prefix);
             close(upstream_fd);
@@ -759,52 +803,58 @@ int main(int argc, char *argv[])
     sigemptyset(&sc.sa_mask);
     sigaction(SIGCHLD, &sc, NULL);
 
+    int any_tls_local = 0;
+    for (size_t i = 0; i < cfg.num_conns; i++)
+        if (cfg.conns[i].tls_local) any_tls_local = 1;
+
     SSL_CTX *server_ctx = NULL;
-    if (cfg.use_tls_local) {
+    if (any_tls_local) {
         server_ctx = make_server_ctx();
         if (!server_ctx) {
             fprintf(stderr, "%s: failed to initialise local TLS context\n"
                             "  Run ./scripts/gen-certs.sh to create test certs\n",
                             log_prefix);
+            free(cfg.conns);
             return EXIT_FAILURE;
         }
         fprintf(stderr, "%s: local TLS enabled (cert=%s key=%s)\n",
                 log_prefix, SERVER_CERT, SERVER_KEY);
     }
 
-    /* Open one listening socket per port */
-    struct pollfd *pfds = calloc(cfg.num_ports, sizeof(*pfds));
+    /* Open one listening socket per -c entry */
+    struct pollfd *pfds = calloc(cfg.num_conns, sizeof(*pfds));
     if (!pfds) { perror("calloc"); return EXIT_FAILURE; }
 
-    for (unsigned i = 0; i < cfg.num_ports; i++) {
-        int fd = listen_on((uint16_t)(cfg.local_port + i));
+    for (size_t i = 0; i < cfg.num_conns; i++) {
+        int fd = listen_on(cfg.conns[i].local_port);
         if (fd < 0) {
             fprintf(stderr, "%s: cannot listen on port %u\n",
-                    log_prefix, cfg.local_port + i);
-            for (unsigned j = 0; j < i; j++) close(pfds[j].fd);
+                    log_prefix, cfg.conns[i].local_port);
+            for (size_t j = 0; j < i; j++) close(pfds[j].fd);
             free(pfds);
+            free(cfg.conns);
             if (server_ctx) SSL_CTX_free(server_ctx);
             return EXIT_FAILURE;
         }
         pfds[i].fd     = fd;
         pfds[i].events = POLLIN;
+
+        fprintf(stderr, "%s: listening on 0.0.0.0:%u%s -> %s:%u%s\n",
+                log_prefix, cfg.conns[i].local_port,
+                cfg.conns[i].tls_local ? " (TLS)" : "",
+                cfg.conns[i].remote_ip, cfg.conns[i].remote_port,
+                cfg.conns[i].tls_remote ? " (TLS)" : "");
     }
 
-    fprintf(stderr, "%s: listening on 0.0.0.0:%u-%u%s -> %s:%u-%u%s\n",
-            log_prefix, cfg.local_port, cfg.local_port + cfg.num_ports - 1,
-            cfg.use_tls_local ? " (TLS)" : "",
-            cfg.remote_ip, cfg.remote_port, cfg.remote_port + cfg.num_ports - 1,
-            cfg.use_tls_remote ? " (TLS)" : "");
-
     while (running) {
-        int rc = poll(pfds, cfg.num_ports, 1000);
+        int rc = poll(pfds, cfg.num_conns, 1000);
         if (rc < 0) {
             if (errno == EINTR) continue;
             perror("poll"); break;
         }
         if (rc == 0) continue;
 
-        for (unsigned i = 0; i < cfg.num_ports; i++) {
+        for (size_t i = 0; i < cfg.num_conns; i++) {
             if (!(pfds[i].revents & POLLIN)) continue;
 
             struct sockaddr_storage peer_sa;
@@ -829,11 +879,11 @@ int main(int argc, char *argv[])
                 peer_port = ntohs(s->sin6_port);
             }
 
-            uint16_t lport = (uint16_t)(cfg.local_port + i);
-            uint16_t rport = (uint16_t)(cfg.remote_port + i);
+            const conn_t *conn = &cfg.conns[i];
             if (Debug) {
-                fprintf(stderr, "%s: accepted connection from %s:%u on port %u -> remote port %u\n",
-                        log_prefix, peer_str, peer_port, lport, rport);
+                fprintf(stderr, "%s: accepted connection from %s:%u on port %u -> %s:%u\n",
+                        log_prefix, peer_str, peer_port, conn->local_port,
+                        conn->remote_ip, conn->remote_port);
             }
 
             pid_t pid = fork();
@@ -844,9 +894,9 @@ int main(int argc, char *argv[])
             }
             if (pid == 0) {
                 /* Child: serve this single connection */
-                for (unsigned j = 0; j < cfg.num_ports; j++) close(pfds[j].fd);
+                for (size_t j = 0; j < cfg.num_conns; j++) close(pfds[j].fd);
                 signal(SIGINT,  SIG_DFL);
-                handle_connection(&cfg, server_ctx, client_fd, rport,
+                handle_connection(conn, server_ctx, client_fd,
                                   peer_str, peer_port);
                 _exit(EXIT_SUCCESS);
             }
@@ -854,8 +904,9 @@ int main(int argc, char *argv[])
         }
     }
 
-    for (unsigned i = 0; i < cfg.num_ports; i++) close(pfds[i].fd);
+    for (size_t i = 0; i < cfg.num_conns; i++) close(pfds[i].fd);
     free(pfds);
+    free(cfg.conns);
     if (server_ctx) SSL_CTX_free(server_ctx);
 
     fprintf(stderr, "%s: shut down cleanly\n", log_prefix);
