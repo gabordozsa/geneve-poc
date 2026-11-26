@@ -766,8 +766,9 @@ static void handle_connection(const conn_t *conn,
                 closed == RELAY_UPSTREAM ? "upstream closed" : "downstream closed");
     }
 
-    if (client_ssl)   SSL_free(client_ssl);
-    if (upstream_ssl) SSL_free(upstream_ssl);
+    /* Send close_notify so the peer sees a clean TLS close, not a bare EOF */
+    if (client_ssl)   { SSL_shutdown(client_ssl);   SSL_free(client_ssl); }
+    if (upstream_ssl) { SSL_shutdown(upstream_ssl); SSL_free(upstream_ssl); }
     close(client_fd);
     close(upstream_fd);
 }
